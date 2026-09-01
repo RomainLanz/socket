@@ -1,6 +1,6 @@
 {
   "name": "@rlanz/socket",
-  "version": "0.0.1-10",
+  "version": "0.1.0",
   "description": "WebSocket integration for AdonisJS",
   "type": "module",
   "main": "./build/index.js",
