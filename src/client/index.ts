@@ -1,0 +1,21 @@
+export { Socket } from './socket.js'
+export type {
+  SocketOptions,
+  SubscribeOptions,
+  UnsubscribeOptions,
+  SubscribeAckData,
+  SubscribeResult,
+  PresenceData,
+  PresenceUser,
+  ConnectionState,
+  EventHandler,
+  ChannelMessage,
+  ChannelAck,
+  ChannelPattern,
+  ChannelParameters,
+  ChannelCallArgs,
+  ChannelClientEvent,
+  ChannelClientEventPayload,
+  ChannelBroadcastEvent,
+  ChannelBroadcastPayload,
+} from './types.js'
