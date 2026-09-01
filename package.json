@@ -118,7 +118,7 @@
   "homepage": "https://github.com/rlanz/socket#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/rlanz/socket.git"
+    "url": "https://github.com/RomainLanz/socket"
   },
   "bugs": {
     "url": "https://github.com/rlanz/socket/issues"
