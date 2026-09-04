@@ -130,6 +130,12 @@ export type ChannelBroadcastPayload<
   Event extends ChannelBroadcastEvent<Registry, Pattern>,
 > = ServerEvents<ChannelContractFor<Registry, Pattern>>[Event]
 
+/** Details about a rejected automatic channel resubscription. */
+export interface ResubscribeErrorContext {
+  channel: string
+  error: Error
+}
+
 /**
  * Connection options.
  */
@@ -164,6 +170,11 @@ export interface SocketOptions {
    * By default, deliberate server disconnects are terminal and other closes reconnect.
    */
   shouldReconnect?: (event: CloseEvent) => boolean
+
+  /**
+   * Handles a rejected automatic channel resubscription.
+   */
+  onResubscribeError?: (context: ResubscribeErrorContext) => void
 }
 
 /**

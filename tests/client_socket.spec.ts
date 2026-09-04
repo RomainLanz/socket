@@ -319,7 +319,7 @@ test.group('client socket', () => {
 
     try {
       await client.connect()
-      await client[resolveChannel]('chat/general').subscribe()
+      const channel = await client[resolveChannel]('chat/general').subscribe()
 
       assert.deepEqual(subscribedChannels, ['chat/general'])
 
@@ -341,6 +341,67 @@ test.group('client socket', () => {
         await waitFor(() => subscribedChannels.length === 2)
 
         assert.deepEqual(subscribedChannels, ['chat/general', 'chat/general'])
+        assert.isTrue(channel.active)
+      } finally {
+        client.disconnect()
+        await closeWsServer(secondWsServer)
+        await closeHttpServer(secondHttpServer)
+      }
+    } finally {
+      client.disconnect()
+      await closeWsServer(firstWsServer)
+      await closeHttpServer(firstHttpServer)
+    }
+  }).timeout(10_000)
+
+  test('passes rejected automatic resubscriptions to the configured handler', async ({
+    assert,
+    cleanup,
+  }) => {
+    const runtime = globalThis as typeof globalThis & { reportError?: (error: unknown) => void }
+    const previousReportError = runtime.reportError
+    const reportedErrors: unknown[] = []
+    runtime.reportError = (error) => reportedErrors.push(error)
+    cleanup(() => {
+      runtime.reportError = previousReportError
+    })
+
+    const subscriptionErrors: Array<{ channel: string; error: Error }> = []
+    const firstHttpServer = createServer()
+    const firstWsServer = createSocketServer(firstHttpServer, (_channelName, reply) => reply.ok())
+    const port = await listen(firstHttpServer)
+    const client = new ClientSocket({
+      url: `http://127.0.0.1:${port}`,
+      reconnectDelay: 5,
+      reconnectMaxDelay: 5,
+      onResubscribeError(context) {
+        subscriptionErrors.push(context)
+      },
+    })
+
+    try {
+      await client.connect()
+      await client.channel('chat/general').subscribe()
+
+      await closeWsServer(firstWsServer)
+      await closeHttpServer(firstHttpServer)
+      await waitFor(() => client.state === 'disconnected')
+
+      const secondHttpServer = createServer()
+      const secondWsServer = createSocketServer(secondHttpServer, (_channelName, reply) => {
+        reply.fail('Forbidden')
+      })
+
+      try {
+        await new Promise<void>((resolve) => {
+          secondHttpServer.listen(port, '127.0.0.1', resolve)
+        })
+        await waitFor(() => subscriptionErrors.length === 1 || reportedErrors.length === 1)
+
+        assert.equal(subscriptionErrors[0].channel, 'chat/general')
+        assert.equal(subscriptionErrors[0].error.message, 'Forbidden')
+        assert.lengthOf(subscriptionErrors, 1)
+        assert.lengthOf(reportedErrors, 0)
       } finally {
         client.disconnect()
         await closeWsServer(secondWsServer)
@@ -693,7 +754,6 @@ test.group('client socket', () => {
     const hereSnapshots: string[][] = []
     const joiningUsers: string[] = []
     const leavingUsers: string[] = []
-    const originalConsoleError = console.error
 
     const firstHttpServer = createServer()
     const firstWsServer = createSocketServer(firstHttpServer, (channelName, reply) => {
@@ -712,8 +772,6 @@ test.group('client socket', () => {
       .leaving((user) => leavingUsers.push(user.name as string))
 
     try {
-      console.error = () => {}
-
       await client.connect()
       await channel.subscribe()
 
@@ -804,7 +862,6 @@ test.group('client socket', () => {
       }
     } finally {
       client.disconnect()
-      console.error = originalConsoleError
       await closeWsServer(firstWsServer)
       await closeHttpServer(firstHttpServer)
     }

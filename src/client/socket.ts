@@ -1,6 +1,6 @@
 import { Channel } from './channel.js'
 import { ClientSocketSession } from './socket_session.js'
-import { reportClientError } from './callback.js'
+import { callClientHandler } from './callback.js'
 import { BindableChannelPattern } from '../bindable_channel_pattern.js'
 import type {
   SocketOptions,
@@ -50,6 +50,7 @@ export class Socket<Registry = undefined> implements SocketClientTransport {
   #url: string
   #path: string
   #session: ClientSocketSession
+  #onResubscribeError: SocketOptions['onResubscribeError']
 
   constructor(options: SocketOptions = {}) {
     const browserWindow = globalThis as typeof globalThis & {
@@ -62,6 +63,7 @@ export class Socket<Registry = undefined> implements SocketClientTransport {
 
     this.#url = options.url ?? browserOrigin
     this.#path = options.path ?? '/socket'
+    this.#onResubscribeError = options.onResubscribeError
     this.#session = new ClientSocketSession({
       buildUrl: () => this.#buildUrl(),
       autoReconnect: options.autoReconnect,
@@ -162,7 +164,14 @@ export class Socket<Registry = undefined> implements SocketClientTransport {
   async #resubscribeChannels(): Promise<void> {
     for (const channel of this.#channels.values()) {
       if (channel.subscribed && !channel.active) {
-        await channel.$resubscribe().catch(reportClientError)
+        await channel.$resubscribe().catch((error) => {
+          if (this.#onResubscribeError) {
+            callClientHandler(this.#onResubscribeError, {
+              channel: channel.name,
+              error: error instanceof Error ? error : new Error('Resubscribe failed'),
+            })
+          }
+        })
       }
     }
   }

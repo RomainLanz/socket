@@ -1,6 +1,7 @@
 export { Socket } from './socket.js'
 export type {
   SocketOptions,
+  ResubscribeErrorContext,
   SubscribeOptions,
   UnsubscribeOptions,
   SubscribeAckData,

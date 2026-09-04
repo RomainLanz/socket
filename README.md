@@ -524,6 +524,10 @@ const socket = new Socket<AppSocket>({
   autoReconnect: true,
   reconnectDelay: 250,
   reconnectMaxDelay: 5000,
+  onResubscribeError({ channel, error }) {
+    if (error.message === 'Session expired') return
+    console.error(`Could not resubscribe to ${channel}`, error)
+  },
 })
 
 socket.onStateChange((state) => {
@@ -565,7 +569,9 @@ socket.disconnect()
 
 Automatic reconnection starts at `250ms` and doubles up to `5s`. After reconnecting, the client
 subscribes again to desired channels. Pending acknowledgements fail and authentication and channel
-middleware run again. Events sent while disconnected are not replayed.
+middleware run again. Events sent while disconnected are not replayed. A rejected automatic
+subscription calls `onResubscribeError` with the channel name and error. The client does not report
+this protocol outcome as a global JavaScript error.
 
 Set `autoReconnect: false` to disable retries. A deliberate server disconnect is terminal by
 default. Use `shouldReconnect(closeEvent)` to override the decision for any close code or reason.
