@@ -565,14 +565,17 @@ socket.disconnect()
 
 `subscribe()` and `unsubscribe()` accept `{ timeout }` in milliseconds. The default is `5000`.
 
-Automatic reconnection starts at `250ms` and doubles up to `5s`. After reconnecting, the client
+Automatic reconnection uses exponential backoff with jitter. The first retry waits between `125ms`
+and `250ms`; later retries double the upper bound up to `5s`. After reconnecting, the client
 subscribes again to desired channels. Pending acknowledgements fail and authentication and channel
 middleware run again. Events sent while disconnected are not replayed. A rejected automatic
 subscription calls `onResubscribeError` with the channel name and error. The client does not report
 this protocol outcome as a global JavaScript error.
 
-Set `autoReconnect: false` to disable retries. A deliberate server disconnect is terminal by
-default. Use `shouldReconnect(closeEvent)` to override the decision for any close code or reason.
+Set `autoReconnect: false` to disable retries. An explicit server disconnect uses close code `4000`
+and is terminal by default. A service shutdown uses the standard `1012 Service Restart` code and
+reconnects without application configuration. Use `shouldReconnect(closeEvent)` to override the
+decision for any close code or reason.
 
 ### React
 
@@ -768,8 +771,9 @@ and replay where needed.
 
 ### Shutdown and resource limits
 
-During shutdown, the service becomes unready, rejects new upgrades, closes existing sockets, runs
-subscription and disconnect hooks, and then disconnects the bus. It does not drain established
+During shutdown, the service becomes unready, rejects new upgrades, closes existing sockets with
+`1012 Service Restart`, runs subscription and disconnect hooks, and then disconnects the bus. The
+client reconnects and restores desired channel subscriptions. The service does not drain established
 sockets or wait for pending client acknowledgements.
 
 After `shutdownTimeout`, the service releases its internal socket and subscription state. JavaScript

@@ -16,6 +16,7 @@ import type {
 import type { SocketUpgradeContextRunner } from './socket_upgrader.js'
 import {
   SERVER_DISCONNECT_CODE,
+  SERVICE_RESTART_CODE,
   type ChannelMessage,
   type ServerProtocolMessage,
 } from './shared_types.js'
@@ -67,6 +68,7 @@ const CLOSE_MESSAGE_TOO_BIG = 1009
 const CLOSE_OUTBOUND_BUFFER_LIMIT = 'Socket outbound buffer limit exceeded'
 const CLOSE_OUTBOUND_MESSAGE_TOO_BIG = 'Socket outbound message too big'
 const SERVER_DISCONNECT_REASON = 'Socket server disconnected'
+const SERVICE_RESTART_REASON = 'Socket service restarting'
 
 interface InboundMessageConfig {
   maxPayload: number
@@ -1196,7 +1198,7 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
     const sockets = [...this.#sockets.values()]
     for (const socket of sockets) {
       const { connection } = socket.raw
-      connection.close(SERVER_DISCONNECT_CODE, SERVER_DISCONNECT_REASON)
+      connection.close(SERVICE_RESTART_CODE, SERVICE_RESTART_REASON)
       const terminateTimer = setTimeout(() => connection.terminate(), 50)
       connection.once('close', () => clearTimeout(terminateTimer))
     }

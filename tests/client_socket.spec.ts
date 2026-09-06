@@ -5,6 +5,7 @@ import { BaseChannel } from '../src/base_channel.js'
 import { ChannelRouter } from '../src/channel_router.js'
 import { resolveChannel, Socket as ClientSocket } from '../src/client/socket.js'
 import { Channel } from '../src/client/channel.js'
+import { SERVICE_RESTART_CODE } from '../src/shared_types.js'
 import type {
   ChannelAck,
   ChannelContract,
@@ -302,10 +303,11 @@ test.group('client socket', () => {
     }
   })
 
-  test('resubscribes subscribed channels after reconnect without duplicating initial subscribe', async ({
+  test('reconnects, resubscribes, and receives events after a service restart', async ({
     assert,
   }) => {
     const subscribedChannels: string[] = []
+    const received: unknown[] = []
     const firstHttpServer = createServer()
     const firstWsServer = createSocketServer(firstHttpServer, (channelName, reply) => {
       subscribedChannels.push(channelName)
@@ -315,14 +317,26 @@ test.group('client socket', () => {
 
     const client = new ClientSocket({
       url: `http://127.0.0.1:${port}`,
+      reconnectDelay: 5,
+      reconnectMaxDelay: 5,
     })
 
     try {
       await client.connect()
-      const channel = await client[resolveChannel]('chat/general').subscribe()
+      const channel = client[resolveChannel]('chat/general')
+      channel.listen('message', (message) => received.push(message))
+      await channel.subscribe()
 
       assert.deepEqual(subscribedChannels, ['chat/general'])
 
+      const restarted = [...firstWsServer.clients].map(
+        (socket) =>
+          new Promise<void>((resolve) => {
+            socket.once('close', resolve)
+            socket.close(SERVICE_RESTART_CODE, 'Socket service restarting')
+          })
+      )
+      await Promise.all(restarted)
       await closeWsServer(firstWsServer)
       await closeHttpServer(firstHttpServer)
       await waitFor(() => client.state === 'disconnected')
@@ -339,8 +353,11 @@ test.group('client socket', () => {
         })
 
         await waitFor(() => subscribedChannels.length === 2)
+        broadcastChannelEvent(secondWsServer, 'chat/general', 'message', { text: 'welcome back' })
+        await waitFor(() => received.length === 1)
 
         assert.deepEqual(subscribedChannels, ['chat/general', 'chat/general'])
+        assert.deepEqual(received, [{ text: 'welcome back' }])
         assert.isTrue(channel.active)
       } finally {
         client.disconnect()

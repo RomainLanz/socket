@@ -9,6 +9,7 @@ import { ChannelRouter } from '../src/channel_router.js'
 import { onMessage } from '../src/decorators.js'
 import { PresenceManager } from '../src/presence_manager.js'
 import { SocketService } from './helpers/socket_service.js'
+import { SERVER_DISCONNECT_CODE, SERVICE_RESTART_CODE } from '../src/shared_types.js'
 import { broadcastChannel } from '../src/tracing_channels.js'
 import type { SocketTransportConfig } from '../src/socket_bus.js'
 import type { SocketConfig } from '../src/types.js'
@@ -298,6 +299,43 @@ function makeTransportConfig(channel = `socket:test:${randomUUID()}`): SocketTra
 }
 
 test.group('socket service', () => {
+  test('distinguishes explicit disconnects from service shutdown', async ({ assert }) => {
+    const httpServer = createServer()
+    const socket = new SocketService()
+    const disconnected = Promise.withResolvers<void>()
+    let connection = 0
+
+    socket.on('connect', ({ socket: client }) => {
+      connection += 1
+      if (connection === 1) client.disconnect()
+      if (connection === 2) disconnected.resolve()
+    })
+
+    await socket.boot(httpServer, {}, new ChannelRouter(), makeLogger())
+    const port = await listen(httpServer)
+    const kickedClient = await connectClient(port)
+
+    try {
+      assert.deepEqual(await waitForClose(kickedClient), {
+        code: SERVER_DISCONNECT_CODE,
+        reason: 'Socket server disconnected',
+      })
+
+      const restartingClient = await connectClient(port)
+      await disconnected.promise
+      const restartingClientClosed = waitForClose(restartingClient)
+      await socket.close()
+
+      assert.deepEqual(await restartingClientClosed, {
+        code: SERVICE_RESTART_CODE,
+        reason: 'Socket service restarting',
+      })
+    } finally {
+      await socket.close()
+      await closeHttpServer(httpServer)
+    }
+  })
+
   test('boots idempotently without leaking upgrade listeners', async ({ assert }) => {
     const httpServer = createServer()
     const socket = new SocketService()

@@ -45,6 +45,7 @@ interface ClientSocketSessionOptions {
   autoReconnect?: boolean
   reconnectDelay?: number
   reconnectMaxDelay?: number
+  random?: () => number
   shouldReconnect?: (event: CloseEvent) => boolean
   onConnected?: () => void
 }
@@ -60,6 +61,7 @@ export class ClientSocketSession {
   #autoReconnect: boolean
   #reconnectDelay: number
   #reconnectMaxDelay: number
+  #random: () => number
   #shouldReconnect: (event: CloseEvent) => boolean
   #onConnected?: () => void
 
@@ -69,6 +71,7 @@ export class ClientSocketSession {
     this.#autoReconnect = options.autoReconnect ?? true
     this.#reconnectDelay = Math.max(0, options.reconnectDelay ?? 250)
     this.#reconnectMaxDelay = Math.max(this.#reconnectDelay, options.reconnectMaxDelay ?? 5000)
+    this.#random = options.random ?? Math.random
     this.#shouldReconnect =
       options.shouldReconnect ?? ((event) => event.code !== SERVER_DISCONNECT_CODE)
     this.#onConnected = options.onConnected
@@ -360,10 +363,11 @@ export class ClientSocketSession {
   #scheduleReconnect(disconnected: DisconnectedLifecycle): void {
     if (!this.#autoReconnect || this.#lifecycle !== disconnected) return
 
-    const delay = Math.min(
+    const backoff = Math.min(
       this.#reconnectDelay * 2 ** disconnected.reconnectAttempt,
       this.#reconnectMaxDelay
     )
+    const delay = backoff * (0.5 + this.#random() * 0.5)
     const waiting: WaitingLifecycle = {
       kind: 'waiting',
       reconnectAttempt: disconnected.reconnectAttempt + 1,

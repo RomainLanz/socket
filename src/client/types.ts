@@ -156,18 +156,18 @@ export interface SocketOptions {
   autoReconnect?: boolean
 
   /**
-   * Initial automatic reconnection delay in ms. Defaults to 250.
+   * Upper bound for the initial automatic reconnection delay in ms. Defaults to 250.
    */
   reconnectDelay?: number
 
   /**
-   * Maximum automatic reconnection delay in ms. Defaults to 5000.
+   * Maximum automatic reconnection delay upper bound in ms. Defaults to 5000.
    */
   reconnectMaxDelay?: number
 
   /**
    * Decides whether a remotely closed connection should reconnect.
-   * By default, deliberate server disconnects are terminal and other closes reconnect.
+   * By default, explicit server disconnects (4000) are terminal and service restarts (1012) reconnect.
    */
   shouldReconnect?: (event: CloseEvent) => boolean
 

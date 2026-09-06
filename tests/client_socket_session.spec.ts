@@ -1,7 +1,8 @@
 import { test } from '@japa/runner'
 import { ClientSocketSession } from '../src/client/socket_session.js'
+import { SERVICE_RESTART_CODE } from '../src/shared_types.js'
 
-type FakeWebSocketListener = (event: { data?: unknown }) => void
+type FakeWebSocketListener = (event: { data?: unknown; code?: number }) => void
 
 class FakeWebSocket {
   static readonly OPEN = 1
@@ -38,6 +39,10 @@ class FakeWebSocket {
 
   emit(event: string, data?: unknown): void {
     this.#listeners.get(event)?.forEach((listener) => listener({ data }))
+  }
+
+  emitClose(code: number): void {
+    this.#listeners.get('close')?.forEach((listener) => listener({ code }))
   }
 }
 
@@ -491,6 +496,7 @@ test.group('client socket session', () => {
       buildUrl: () => 'ws://localhost/socket',
       reconnectDelay: 1,
       reconnectMaxDelay: 10,
+      random: () => 1,
       createWebSocket(url) {
         const socket = new FakeWebSocket(url)
         sockets.push(socket)
@@ -525,7 +531,44 @@ test.group('client socket session', () => {
     )
   })
 
-  test('emits one disconnect transition across repeated disconnect calls', async ({ assert }) => {
+  test('bounds service restart jitter between half and all of the backoff', async ({
+    assert,
+    cleanup,
+  }) => {
+    const delays: number[] = []
+    const originalSetTimeout = globalThis.setTimeout
+    cleanup(() => {
+      globalThis.setTimeout = originalSetTimeout
+    })
+    globalThis.setTimeout = ((_handler: () => void, timeout?: number) => {
+      delays.push(Number(timeout))
+      return Object.create(null) as ReturnType<typeof setTimeout>
+    }) as typeof setTimeout
+
+    for (const random of [0, 1]) {
+      const sockets: FakeWebSocket[] = []
+      const session = new ClientSocketSession({
+        buildUrl: () => 'ws://localhost/socket',
+        reconnectDelay: 100,
+        reconnectMaxDelay: 100,
+        random: () => random,
+        createWebSocket(url) {
+          const socket = new FakeWebSocket(url)
+          sockets.push(socket)
+          return socket as unknown as WebSocket
+        },
+      })
+
+      const connection = session.connect()
+      sockets[0].emit('open')
+      await connection
+      sockets[0].emitClose(SERVICE_RESTART_CODE)
+    }
+
+    assert.deepEqual(delays, [50, 100])
+  })
+
+  test('keeps manual disconnect terminal across repeated calls', async ({ assert, cleanup }) => {
     const sockets: FakeWebSocket[] = []
     const states: string[] = []
     const events: string[] = []
@@ -543,11 +586,23 @@ test.group('client socket session', () => {
     const connection = session.connect()
     sockets[0].emit('open')
     await connection
+
+    let scheduledRetries = 0
+    const originalSetTimeout = globalThis.setTimeout
+    cleanup(() => {
+      globalThis.setTimeout = originalSetTimeout
+    })
+    globalThis.setTimeout = ((_handler: () => void, _timeout?: number) => {
+      scheduledRetries += 1
+      return Object.create(null) as ReturnType<typeof setTimeout>
+    }) as typeof setTimeout
+
     session.disconnect()
     session.disconnect()
 
     assert.deepEqual(states, ['connecting', 'connected', 'disconnected'])
     assert.deepEqual(events, ['disconnect'])
+    assert.equal(scheduledRetries, 0)
   })
 
   test('does not let a failed reconnect tear down a newer connection attempt', async ({

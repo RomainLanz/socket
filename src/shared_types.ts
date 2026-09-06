@@ -5,6 +5,9 @@
 /** WebSocket close code used when the server deliberately ends a client session. */
 export const SERVER_DISCONNECT_CODE = 4000
 
+/** Standard WebSocket close code used when the service restarts. */
+export const SERVICE_RESTART_CODE = 1012
+
 /**
  * Message sent by the client to a channel.
  */
