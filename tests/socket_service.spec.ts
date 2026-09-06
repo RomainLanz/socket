@@ -960,7 +960,8 @@ test.group('socket service', () => {
       assert.deepEqual(connectedSocket.user, { id: 'user-1' })
       assert.deepEqual(connectedSocket.getUserOrFail(), { id: 'user-1' })
       assert.deepEqual(connectedSocket.raw.data, {})
-      assert.isDefined(connectedSocket.raw.httpContext)
+      assert.notProperty(connectedSocket.raw, 'request')
+      assert.notProperty(connectedSocket.raw, 'httpContext')
 
       connectedSocket.user = undefined
       let error: unknown

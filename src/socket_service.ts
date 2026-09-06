@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto'
-import type { IncomingMessage } from 'node:http'
 import type { Server as HttpServer } from 'node:http'
 import type { Logger } from '@adonisjs/logger'
 import Emittery from 'emittery'
@@ -500,8 +499,8 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
 
       const upgradeHandler: SocketUpgradeHandler = (request, socket, head) => {
         upgrader
-          .handle(request, socket, head, (connection, upgradeRequest, accepted) => {
-            this.#handleConnection(connection, upgradeRequest, accepted, inboundMessageConfig)
+          .handle(request, socket, head, (connection, accepted) => {
+            this.#handleConnection(connection, accepted, inboundMessageConfig)
           })
           .catch((error) => {
             this.#warn('failed to upgrade socket connection: %s', error)
@@ -550,7 +549,6 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
 
   #handleConnection(
     connection: WebSocket,
-    request: IncomingMessage,
     upgrade: AcceptedUpgrade<User>,
     inboundMessageConfig: InboundMessageConfig
   ): void {
@@ -559,7 +557,7 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
       return
     }
 
-    const socket = this.#wrapSocket(connection, request, upgrade)
+    const socket = this.#wrapSocket(connection, upgrade)
 
     connectChannel.traceSync(
       () => {
@@ -778,17 +776,11 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
     return this.#channelSubscriptions!.relayWhisper(socket, payload)
   }
 
-  #wrapSocket(
-    connection: WebSocket,
-    request: IncomingMessage,
-    upgrade: AcceptedUpgrade<User>
-  ): AuthenticatedSocket<User> {
+  #wrapSocket(connection: WebSocket, upgrade: AcceptedUpgrade<User>): AuthenticatedSocket<User> {
     const raw: RawSocket = {
       id: randomUUID(),
       data: {},
       connection,
-      request,
-      httpContext: upgrade.httpContext,
     }
 
     return {

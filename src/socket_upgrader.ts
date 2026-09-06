@@ -7,17 +7,12 @@ import type { SocketConfig, SocketUpgradeContext } from './types.js'
 export const DEFAULT_WEBSOCKET_PATH = '/socket'
 
 export interface AcceptedUpgrade<User> {
-  httpContext: HttpContext
   user?: User
 }
 
 export type SocketUpgradeHandler = (request: IncomingMessage, socket: Duplex, head: Buffer) => void
 
-type AcceptUpgrade<User> = (
-  connection: WebSocket,
-  request: IncomingMessage,
-  upgrade: AcceptedUpgrade<User>
-) => void
+type AcceptUpgrade<User> = (connection: WebSocket, upgrade: AcceptedUpgrade<User>) => void
 
 export type SocketUpgradeContextRunner = <Result>(
   request: IncomingMessage,
@@ -66,7 +61,7 @@ export class SocketUpgrader<User = unknown> {
     }
 
     this.server.handleUpgrade(request, socket, head, (connection) => {
-      accept(connection, request, result.accepted)
+      accept(connection, result.accepted)
     })
 
     return true
@@ -158,7 +153,7 @@ export class SocketUpgrader<User = unknown> {
   async #authenticate(httpContext: HttpContext): Promise<AcceptedUpgrade<User> | null> {
     const config = this.config
     if (!config?.authenticate) {
-      return { httpContext }
+      return {}
     }
 
     try {
@@ -173,7 +168,6 @@ export class SocketUpgrader<User = unknown> {
       }
 
       return {
-        httpContext,
         user: result,
       }
     } catch (error) {

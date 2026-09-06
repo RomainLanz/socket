@@ -313,7 +313,9 @@ test.group('socket provider', () => {
     )
   })
 
-  test('creates and retains exactly one context without auth or middleware', async ({ assert }) => {
+  test('releases the HTTP context after connecting without auth or middleware', async ({
+    assert,
+  }) => {
     const httpServer = createServer()
     const server = makeServer(httpServer)
     const originalCreate = server.createHttpContext
@@ -330,9 +332,9 @@ test.group('socket provider', () => {
     await provider.boot()
     await provider.ready()
     const socket = await app.container.make('socket')
-    let connectedContext: unknown
+    let connectedRaw: Record<string, unknown> | undefined
     socket.on('connect', ({ socket: connectedSocket }: any) => {
-      connectedContext = connectedSocket.raw.httpContext
+      connectedRaw = connectedSocket.raw
     })
     const port = await listen(httpServer)
     const client = await connectClient(port)
@@ -340,7 +342,8 @@ test.group('socket provider', () => {
     try {
       assert.equal(createdContexts, 1)
       assert.instanceOf(createdContext, HttpContext)
-      assert.strictEqual(connectedContext, createdContext)
+      assert.notProperty(connectedRaw, 'request')
+      assert.notProperty(connectedRaw, 'httpContext')
     } finally {
       client.close()
       await socket.close()

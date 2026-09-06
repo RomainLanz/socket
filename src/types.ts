@@ -1,5 +1,4 @@
 import type { WebSocket } from 'ws'
-import type { IncomingMessage } from 'node:http'
 import type { MiddlewareAsClass } from '@adonisjs/core/types/http'
 import type { HttpContext } from '@adonisjs/core/http'
 import type { PresenceData as ChannelPresenceData } from './presence_manager.js'
@@ -14,8 +13,6 @@ export interface RawSocket {
   id: string
   data: Record<string, unknown>
   connection: WebSocket
-  request: IncomingMessage
-  httpContext: HttpContext
 }
 
 /**

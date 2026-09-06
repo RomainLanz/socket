@@ -206,10 +206,8 @@ export default defineConfig({
 Upgrade middleware and channel middleware have different jobs. Upgrade middleware prepares the HTTP
 handshake. Channel middleware authorizes one subscription.
 
-Every socket retains the initial HTTP context at `socket.raw.httpContext`. This context describes the
-handshake. It is not an active request after the `101` response and is not installed in AdonisJS
-async-local storage. Put mutable socket-lifetime state in `socket.raw.data`. Copy durable identity
-into `socket.user` instead of retaining response-bound resources.
+Socket releases the upgrade request and HTTP context after authentication. Copy durable identity
+into `socket.user`, and put mutable socket-lifetime state in `socket.raw.data`.
 
 ## Define channels
 
