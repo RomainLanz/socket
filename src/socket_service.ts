@@ -16,6 +16,8 @@ import type {
 import type { SocketUpgradeContextRunner } from './socket_upgrader.js'
 import {
   SERVER_DISCONNECT_CODE,
+  SERVER_GOING_AWAY_CODE,
+  SERVER_GOING_AWAY_REASON,
   SERVICE_RESTART_CODE,
   type ChannelMessage,
   type ServerProtocolMessage,
@@ -270,6 +272,9 @@ interface SocketServiceRuntime<User> {
   upgradeHandler: SocketUpgradeHandler
   channelSubscriptions: ChannelSubscriptions<User>
   bus: SocketBus | null
+  acceptingUpgrades: boolean
+  serverClose?: Promise<unknown | null>
+  webSocketsClose?: Promise<void>
 }
 
 interface SocketServiceBootOperation<User> {
@@ -516,6 +521,7 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
         upgradeHandler,
         channelSubscriptions: operation.channelSubscriptions,
         bus: operation.bus ?? null,
+        acceptingUpgrades: true,
       }
       operation.runtime = runtime
       httpServer.on('upgrade', upgradeHandler)
@@ -554,7 +560,7 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
     upgrade: AcceptedUpgrade<User>,
     inboundMessageConfig: InboundMessageConfig
   ): void {
-    if (this.#lifecycle.status !== 'ready') {
+    if (!this.ready) {
       connection.terminate()
       return
     }
@@ -964,7 +970,7 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
   }
 
   get ready(): boolean {
-    return this.#lifecycle.status === 'ready'
+    return this.#lifecycle.status === 'ready' && this.#lifecycle.runtime.acceptingUpgrades
   }
 
   fake(): SocketFake {
@@ -1127,6 +1133,26 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
     channelSubscriptions?.clear()
   }
 
+  /** Stops upgrades and closes WebSocket clients without closing the transport. */
+  closeWebSockets(code = SERVER_GOING_AWAY_CODE, reason = SERVER_GOING_AWAY_REASON): Promise<void> {
+    const runtime = this.#runtime
+    if (!runtime) return Promise.resolve()
+    if (runtime.webSocketsClose) return runtime.webSocketsClose
+
+    runtime.acceptingUpgrades = false
+    runtime.httpServer.off('upgrade', runtime.upgradeHandler)
+
+    const deadline = Date.now() + this.#shutdownTimeout
+    const serverClose = this.#startServerClose(runtime)
+    const close = (async () => {
+      const errors = await this.#closeSockets(deadline, code, reason)
+      errors.push(...(await this.#finishServerClose(serverClose, deadline)))
+      this.#throwCloseErrors(errors)
+    })()
+    runtime.webSocketsClose = close
+    return close
+  }
+
   close(): Promise<void> {
     const lifecycle = this.#lifecycle
     if (lifecycle.status === 'stopped') return Promise.resolve()
@@ -1185,20 +1211,24 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
     }
   }
 
-  #startServerClose(server: WebSocketServer | undefined): Promise<unknown | null> {
-    if (!server) return Promise.resolve(null)
+  #startServerClose(runtime: SocketServiceRuntime<User> | undefined): Promise<unknown | null> {
+    if (!runtime) return Promise.resolve(null)
+    if (runtime.serverClose) return runtime.serverClose
 
-    return new Promise((resolve) => {
-      server.close((error) => resolve(error ?? null))
+    runtime.serverClose = new Promise((resolve) => {
+      runtime.server.close((error) => resolve(error ?? null))
     })
+    return runtime.serverClose
   }
 
-  async #closeSockets(deadline: number): Promise<unknown[]> {
+  async #closeSockets(deadline: number, code: number, reason: string): Promise<unknown[]> {
     this.#stopHeartbeat()
     const sockets = [...this.#sockets.values()]
     for (const socket of sockets) {
       const { connection } = socket.raw
-      connection.close(SERVICE_RESTART_CODE, SERVICE_RESTART_REASON)
+      if (connection.readyState === WebSocket.CLOSED) continue
+
+      connection.close(code, reason)
       const terminateTimer = setTimeout(() => connection.terminate(), 50)
       connection.once('close', () => clearTimeout(terminateTimer))
     }
@@ -1258,6 +1288,16 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
     return [result.value]
   }
 
+  #throwCloseErrors(errors: unknown[]): void {
+    if (errors.length === 0) return
+
+    const error =
+      errors.length === 1 && errors[0] instanceof Error
+        ? errors[0]
+        : new AggregateError(errors, 'Socket service shutdown failed')
+    throw error
+  }
+
   async #close(
     resources: SocketServiceResources<User>,
     pendingBoot?: Promise<void>
@@ -1269,17 +1309,15 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
     const channelSubscriptions =
       runtime?.channelSubscriptions ??
       (resources.kind === 'boot' ? resources.channelSubscriptions : undefined)
-    const server = runtime?.server
     const bus = runtime?.bus ?? (resources.kind === 'boot' ? resources.bus : undefined)
-    const httpServer = runtime?.httpServer
-    const upgradeHandler = runtime?.upgradeHandler
 
-    if (httpServer && upgradeHandler) {
-      httpServer.off('upgrade', upgradeHandler)
+    if (runtime) {
+      runtime.acceptingUpgrades = false
+      runtime.httpServer.off('upgrade', runtime.upgradeHandler)
     }
 
-    const serverClose = this.#startServerClose(server)
-    const errors = await this.#closeSockets(deadline)
+    const serverClose = this.#startServerClose(runtime)
+    const errors = await this.#closeSockets(deadline, SERVICE_RESTART_CODE, SERVICE_RESTART_REASON)
 
     this.#cleanup(channelSubscriptions)
     this.#presenceManager?.setSocketFetcher(null)
@@ -1287,12 +1325,6 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
     errors.push(...(await this.#closeBus(resources, bus, deadline)))
     errors.push(...(await this.#finishServerClose(serverClose, deadline)))
 
-    if (errors.length > 0) {
-      const error =
-        errors.length === 1 && errors[0] instanceof Error
-          ? errors[0]
-          : new AggregateError(errors, 'Socket service shutdown failed')
-      throw error
-    }
+    this.#throwCloseErrors(errors)
   }
 }

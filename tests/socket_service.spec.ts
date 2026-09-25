@@ -580,20 +580,29 @@ test.group('socket service', () => {
     await closeHttpServer(httpServer)
   })
 
-  test('resolves close when a peer does not complete the WebSocket close handshake', async ({
-    assert,
-  }) => {
+  test('forces a peer closed when it ignores the going-away handshake', async ({ assert }) => {
     const httpServer = createServer()
     const socket = new SocketService()
 
     await socket.boot(httpServer, {}, new ChannelRouter(), makeLogger())
     const port = await listen(httpServer)
     const client = await connectRawWebSocket(port)
+    const closeFrame = Promise.withResolvers<Buffer>()
+    const clientClosed = Promise.withResolvers<void>()
+    client.once('data', (chunk) => closeFrame.resolve(Buffer.from(chunk)))
+    client.once('close', () => clientClosed.resolve())
 
     try {
-      await mustResolve(socket.close())
+      await mustResolve(socket.closeWebSockets())
+      const frame = await closeFrame.promise
+      await clientClosed.promise
 
+      assert.equal(frame[0], 0x88)
+      assert.equal(frame.readUInt16BE(2), 1001)
+      assert.isTrue(client.destroyed)
+      assert.isFalse(socket.ready)
       assert.equal(socket.connectionsCount, 0)
+      await mustResolve(socket.close())
     } finally {
       client.destroy()
       await socket.close()

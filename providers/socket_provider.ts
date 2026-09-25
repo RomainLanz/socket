@@ -9,6 +9,7 @@ import { BaseChannel } from '../src/base_channel.js'
 import { PresenceManager } from '../src/presence_manager.js'
 import type { SocketUpgradeContextRunner } from '../src/socket_upgrader.js'
 import type { SocketConfig, SocketHttpMiddleware } from '../src/types.js'
+import { SERVER_GOING_AWAY_CODE, SERVER_GOING_AWAY_REASON } from '../src/shared_types.js'
 
 declare module '@adonisjs/core/types' {
   interface ContainerBindings {
@@ -90,6 +91,17 @@ export default class SocketProvider {
         logger,
         this.#createUpgradeContextRunner(config, server)
       )
+      this.app.terminating(async () => {
+        try {
+          await socket.closeWebSockets(SERVER_GOING_AWAY_CODE, SERVER_GOING_AWAY_REASON)
+        } catch (error) {
+          try {
+            logger.warn('failed to close WebSocket clients before HTTP drain: %s', error)
+          } catch {
+            // Logging must not prevent the HTTP server from draining.
+          }
+        }
+      })
       logger.info('server started')
     } catch (error) {
       socket.markFailed(error)

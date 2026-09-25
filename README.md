@@ -573,9 +573,9 @@ subscription calls `onResubscribeError` with the channel name and error. The cli
 this protocol outcome as a global JavaScript error.
 
 Set `autoReconnect: false` to disable retries. An explicit server disconnect uses close code `4000`
-and is terminal by default. A service shutdown uses the standard `1012 Service Restart` code and
-reconnects without application configuration. Use `shouldReconnect(closeEvent)` to override the
-decision for any close code or reason.
+and is terminal by default. App termination uses `1001 Going Away`, while a direct service shutdown
+uses `1012 Service Restart`. Both reconnect without application configuration. Use
+`shouldReconnect(closeEvent)` to override the decision for any close code or reason.
 
 ### React
 
@@ -771,10 +771,11 @@ and replay where needed.
 
 ### Shutdown and resource limits
 
-During shutdown, the service becomes unready, rejects new upgrades, closes existing sockets with
-`1012 Service Restart`, runs subscription and disconnect hooks, and then disconnects the bus. The
-client reconnects and restores desired channel subscriptions. The service does not drain established
-sockets or wait for pending client acknowledgements.
+During app termination, the provider stops new upgrades and closes existing sockets with
+`1001 Going Away` and runs their subscription and disconnect hooks before the HTTP server drains
+in-flight requests. Provider shutdown then disconnects the bus. A direct `SocketService.close()`
+uses `1012 Service Restart`. Clients reconnect and restore desired channel subscriptions by default.
+The service does not wait for pending client acknowledgements.
 
 After `shutdownTimeout`, the service releases its internal socket and subscription state. JavaScript
 handlers that ignore cancellation can continue running.

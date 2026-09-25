@@ -8,6 +8,12 @@ export const SERVER_DISCONNECT_CODE = 4000
 /** Standard WebSocket close code used when the service restarts. */
 export const SERVICE_RESTART_CODE = 1012
 
+/** Standard WebSocket close code used when the server shuts down. */
+export const SERVER_GOING_AWAY_CODE = 1001
+
+/** Reason sent when the server shuts down. */
+export const SERVER_GOING_AWAY_REASON = 'Server going away'
+
 /**
  * Message sent by the client to a channel.
  */

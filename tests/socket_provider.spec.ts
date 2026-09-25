@@ -7,6 +7,7 @@ import { test } from '@japa/runner'
 import { WebSocket } from 'ws'
 import SocketProvider from '../providers/socket_provider.js'
 import { BaseChannel } from '../src/base_channel.js'
+import type { SocketService } from '../src/socket_service.js'
 import { HttpContext } from '@adonisjs/core/http'
 import { HttpContextFactory } from '@adonisjs/core/factories/http'
 import type { SocketConfig } from '../src/types.js'
@@ -107,6 +108,7 @@ function makeApp(
         return key === 'socket' ? config : fallback
       },
     },
+    terminating() {},
     makePath(path: string) {
       return path
     },
@@ -577,6 +579,181 @@ test.group('socket provider', () => {
       client.terminate()
       await socket.close()
       await closeHttpServer(httpServer)
+    }
+  }).timeout(10_000)
+
+  test('closes connected clients before the HTTP server during app termination', async ({
+    assert,
+  }) => {
+    const requestStarted = Promise.withResolvers<void>()
+    const finishRequest = Promise.withResolvers<void>()
+    const httpServer = createServer((_request, response) => {
+      requestStarted.resolve()
+      void finishRequest.promise.then(() => response.end('finished'))
+    })
+    let providerShutdownCalled = false
+    let remainingHookCalled = false
+
+    class ShutdownProbeProvider {
+      async shutdown() {
+        providerShutdownCalled = true
+      }
+    }
+
+    const app = new AppFactory<ContainerBindings>()
+      .merge({
+        importer: async (moduleIdentifier) => {
+          if (moduleIdentifier === '#generated/socket_channels') {
+            return { socketChannels: [] }
+          }
+
+          throw new Error(`Unexpected import: ${moduleIdentifier}`)
+        },
+      })
+      .create(new URL('../', import.meta.url))
+    app.rcContents({
+      providers: [
+        async () => ({ default: ShutdownProbeProvider }),
+        async () => ({ default: SocketProvider }),
+      ],
+    })
+
+    await app.init()
+    app.useConfig({ socket: {} })
+    app.container.bindValue('logger', makeLogger())
+    app.container.bindValue('server', makeServer(httpServer) as any)
+    await app.boot()
+    app.terminating(() => {
+      remainingHookCalled = true
+    })
+
+    let port = 0
+    await app.start(async () => {
+      port = await listen(httpServer)
+      app.terminating(() => closeHttpServer(httpServer))
+    })
+
+    const socket = await app.container.make('socket')
+    const client = await connectClient(port)
+    const clientClosed = Promise.withResolvers<number>()
+    client.once('close', (code) => clientClosed.resolve(code))
+    const httpRequest = fetch(`http://127.0.0.1:${port}/in-flight`)
+    await requestStarted.promise
+    const termination = app.terminate()
+
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    try {
+      const closeCode = await Promise.race([
+        clientClosed.promise,
+        new Promise<null>((resolve) => {
+          timeout = setTimeout(() => resolve(null), 500)
+        }),
+      ])
+      if (timeout) clearTimeout(timeout)
+
+      assert.equal(closeCode, 1001, 'app termination should close WebSockets before draining HTTP')
+      assert.isFalse(remainingHookCalled)
+      assert.isFalse(providerShutdownCalled)
+
+      finishRequest.resolve()
+      const response = await httpRequest
+      assert.equal(await response.text(), 'finished')
+
+      const terminatedInTime = await Promise.race([
+        termination.then(() => true),
+        new Promise<boolean>((resolve) => {
+          timeout = setTimeout(() => resolve(false), 500)
+        }),
+      ])
+      if (timeout) clearTimeout(timeout)
+
+      assert.isTrue(terminatedInTime, 'app.terminate() should finish after the HTTP request drains')
+      assert.isTrue(remainingHookCalled)
+      assert.isTrue(providerShutdownCalled)
+    } finally {
+      finishRequest.resolve()
+      client.terminate()
+      await httpRequest.catch(() => {})
+      await socket.close()
+      await closeHttpServer(httpServer)
+      await termination.catch(() => {})
+    }
+  }).timeout(10_000)
+
+  test('continues app termination when WebSocket closing and warning logs fail', async ({
+    assert,
+  }) => {
+    const httpServer = createServer()
+    let httpCloseHookCalled = false
+    let remainingHookCalled = false
+    let providerShutdownCalled = false
+    let closeWebSocketsCalled = false
+
+    class ShutdownProbeProvider {
+      async shutdown() {
+        providerShutdownCalled = true
+      }
+    }
+
+    const app = new AppFactory<ContainerBindings>()
+      .merge({
+        importer: async (moduleIdentifier) => {
+          if (moduleIdentifier === '#generated/socket_channels') {
+            return { socketChannels: [] }
+          }
+
+          throw new Error(`Unexpected import: ${moduleIdentifier}`)
+        },
+      })
+      .create(new URL('../', import.meta.url))
+    app.rcContents({
+      providers: [
+        async () => ({ default: ShutdownProbeProvider }),
+        async () => ({ default: SocketProvider }),
+      ],
+    })
+
+    await app.init()
+    app.useConfig({ socket: {} })
+    const logger = makeLogger()
+    logger.warn = () => {
+      throw new Error('Unable to log WebSocket shutdown warning')
+    }
+    app.container.bindValue('logger', logger)
+    app.container.bindValue('server', makeServer(httpServer) as any)
+    await app.boot()
+    app.terminating(() => {
+      remainingHookCalled = true
+    })
+
+    let socket: SocketService | undefined
+    let termination: Promise<void> | undefined
+    try {
+      await app.start(async () => {
+        await listen(httpServer)
+        app.terminating(async () => {
+          httpCloseHookCalled = true
+          await closeHttpServer(httpServer)
+        })
+      })
+
+      socket = await app.container.make('socket')
+      socket.closeWebSockets = async () => {
+        closeWebSocketsCalled = true
+        throw new Error('Unable to close WebSocket clients')
+      }
+
+      termination = app.terminate()
+      await termination
+
+      assert.isTrue(closeWebSocketsCalled)
+      assert.isTrue(httpCloseHookCalled)
+      assert.isTrue(remainingHookCalled)
+      assert.isTrue(providerShutdownCalled)
+    } finally {
+      if (socket) await socket.close().catch(() => {})
+      await closeHttpServer(httpServer).catch(() => {})
+      await termination?.catch(() => {})
     }
   }).timeout(10_000)
 })
