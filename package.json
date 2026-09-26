@@ -45,6 +45,7 @@
   },
   "dependencies": {
     "@boringnode/bus": "^0.9.1",
+    "@boringnode/route-matcher": "^0.1.1",
     "@lukeed/ms": "^2.0.2",
     "emittery": "^1.2.0",
     "ws": "^8.21.0"

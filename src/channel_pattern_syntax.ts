@@ -20,18 +20,12 @@ type ChannelPatternSegment =
     }
   | { readonly kind: 'wildcard'; readonly name: string }
 
-export interface ChannelPatternSyntaxMatch {
-  readonly index: number
-  readonly params: Record<string, string>
-}
-
 /**
- * Immutable parsed syntax shared by runtime matching and generated binding.
+ * Parsed syntax used to validate generated channel bindings.
  */
-export class ChannelPatternSyntax {
+export abstract class ChannelPatternSyntax {
   readonly canonicalPattern: string
   protected readonly segments: readonly ChannelPatternSegment[]
-  readonly #specificity: readonly number[]
 
   protected constructor(value: string) {
     const canonicalPattern = ChannelPatternSyntax.#normalize(value)
@@ -99,108 +93,6 @@ export class ChannelPatternSyntax {
       this.canonicalPattern = canonicalPattern
       this.segments = Object.freeze(segments.map((segment) => Object.freeze(segment)))
     }
-
-    this.#specificity = Object.freeze(
-      this.segments.map((segment) => {
-        if (segment.kind === 'static') return 40
-        if (segment.kind === 'wildcard') return 0
-        return segment.optional ? 20 : 30
-      })
-    )
-  }
-
-  /**
-   * Parse one pattern and return its immutable syntax.
-   */
-  static from(value: string): ChannelPatternSyntax {
-    const syntax = new ChannelPatternSyntax(value)
-    Object.freeze(syntax)
-    return syntax
-  }
-
-  /**
-   * Match one channel name and return its decoded parameters.
-   */
-  match(channelName: string): Record<string, string> | null {
-    return this.#matchValues(ChannelPatternSyntax.#split(channelName))
-  }
-
-  /**
-   * Compare this syntax with another syntax for runtime routing.
-   * Return a negative value when this syntax is more specific.
-   */
-  compareSpecificity(other: ChannelPatternSyntax): number {
-    const length = Math.max(this.#specificity.length, other.#specificity.length)
-
-    for (let index = 0; index < length; index++) {
-      const difference = (other.#specificity[index] ?? -1) - (this.#specificity[index] ?? -1)
-      if (difference !== 0) {
-        return difference
-      }
-    }
-
-    return other.#specificity.length - this.#specificity.length
-  }
-
-  /**
-   * Return the first matching syntax without splitting the channel name again.
-   */
-  static firstMatch(
-    patterns: readonly ChannelPatternSyntax[],
-    channelName: string
-  ): ChannelPatternSyntaxMatch | null {
-    const values = ChannelPatternSyntax.#split(channelName)
-    for (const [index, pattern] of patterns.entries()) {
-      const params = pattern.#matchValues(values)
-      if (params) return { index, params }
-    }
-    return null
-  }
-
-  #matchValues(values: string[]): Record<string, string> | null {
-    const finalSegment = this.segments.at(-1)
-
-    // A wildcard can consume extra values. A final optional parameter can be absent.
-    const compatibleLength =
-      this.segments.length === values.length ||
-      (this.segments.length < values.length && finalSegment?.kind === 'wildcard') ||
-      (this.segments.length > values.length &&
-        finalSegment?.kind === 'parameter' &&
-        finalSegment.optional)
-
-    if (
-      !compatibleLength ||
-      !this.segments.every((segment, index) =>
-        ChannelPatternSyntax.#segmentMatches(segment, values[index])
-      )
-    ) {
-      return null
-    }
-
-    const parameters: Record<string, string> = {}
-    for (const [index, segment] of this.segments.entries()) {
-      // The root separator does not produce a parameter.
-      if (values[index] === SEPARATOR) continue
-
-      if (segment.kind === 'wildcard') {
-        // Decode each wildcard value before the values are joined again.
-        if (segment.name === '*') {
-          parameters[segment.name] = values
-            .slice(index)
-            .map(ChannelPatternSyntax.#decode)
-            .join(SEPARATOR)
-        }
-        break
-      }
-
-      if (segment.kind === 'parameter' && values[index] !== undefined) {
-        // Remove the static suffix before the parameter is decoded.
-        parameters[segment.name] = ChannelPatternSyntax.#decode(
-          values[index].replace(segment.suffix, '')
-        )
-      }
-    }
-    return parameters
   }
 
   static #normalize(value: string): string {
@@ -215,35 +107,5 @@ export class ChannelPatternSyntax {
       normalized = normalized.slice(0, -1)
     }
     return normalized
-  }
-
-  static #split(value: string): string[] {
-    const normalized = ChannelPatternSyntax.#normalize(value)
-    return normalized === SEPARATOR ? [SEPARATOR] : normalized.split(SEPARATOR)
-  }
-
-  static #decode(value: string): string {
-    try {
-      return decodeURIComponent(value)
-    } catch {
-      // Keep invalid encoded input unchanged. Matchit uses the same fallback.
-      return value
-    }
-  }
-
-  static #segmentMatches(segment: ChannelPatternSegment, value: string | undefined): boolean {
-    if (segment.kind === 'static') {
-      return segment.value === value
-    }
-    if (value === SEPARATOR) {
-      return segment.kind === 'wildcard' || segment.optional
-    }
-    if (value === '') {
-      return segment.kind === 'wildcard' || segment.suffix === ''
-    }
-    if (value === undefined) {
-      return segment.kind === 'wildcard' || segment.suffix === ''
-    }
-    return segment.kind === 'wildcard' || value.endsWith(segment.suffix)
   }
 }

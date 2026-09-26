@@ -487,6 +487,13 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@boringnode/route-matcher@npm:^0.1.1":
+  version: 0.1.1
+  resolution: "@boringnode/route-matcher@npm:0.1.1"
+  checksum: 10c0/a297144ff92c70186e0986960626f3249d3d291b1441f6a06c19b7bbee36bff78030e99c4d06b03c44636a03d947dcdf5b130fa2e119e0cb4ca819162875912a
+  languageName: node
+  linkType: hard
+
 "@colors/colors@npm:1.5.0":
   version: 1.5.0
   resolution: "@colors/colors@npm:1.5.0"
@@ -1871,6 +1878,7 @@ __metadata:
     "@adonisjs/core": "npm:^7.0.1"
     "@adonisjs/tsconfig": "npm:^2.0.0"
     "@boringnode/bus": "npm:^0.9.1"
+    "@boringnode/route-matcher": "npm:^0.1.1"
     "@japa/assert": "npm:^4.2.0"
     "@japa/runner": "npm:^5.3.0"
     "@lukeed/ms": "npm:^2.0.2"

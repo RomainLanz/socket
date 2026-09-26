@@ -1,10 +1,11 @@
+import { RouteTable } from '@boringnode/route-matcher'
 import {
   SocketResponseError,
   type BaseChannel,
   type BaseChannelConstructor,
   type ChannelMiddlewareRunnerFactory,
 } from './base_channel.js'
-import { ChannelPattern } from './channel_pattern.js'
+import { ChannelPattern, normalizeChannelParams } from './channel_pattern.js'
 import type { AuthenticatedSocket, ChannelMatch, MiddlewareContext } from './types.js'
 
 interface RegisteredChannel {
@@ -31,6 +32,7 @@ export class ChannelRouter {
    * Registered channels keyed by their pattern.
    */
   #channels = new Map<string, RegisteredChannel>()
+  #routes = new RouteTable<RegisteredChannel>({ precedence: 'specificity' })
 
   constructor(
     private makeChannel: ChannelFactory = (channel) => new channel(),
@@ -52,24 +54,26 @@ export class ChannelRouter {
     }
 
     const pattern = ChannelPattern.from(patternValue)
+    const registered = { pattern, channel }
 
-    this.#channels.set(pattern.value, { pattern, channel })
+    this.#routes.add(pattern.tokens, registered)
+    this.#channels.set(pattern.value, registered)
   }
 
   /**
    * Matches a channel name against registered patterns.
    */
   match(channelName: string): ChannelMatch | null {
-    const matched = ChannelPattern.firstMatch(channelName, this.#channels.values())
+    const matched = this.#routes.match(channelName, true)
 
     if (!matched) {
       return null
     }
 
     return {
-      channel: matched.channel,
-      pattern: matched.pattern.value,
-      params: matched.params,
+      channel: matched.value.channel,
+      pattern: matched.value.pattern.value,
+      params: normalizeChannelParams(matched.params),
     }
   }
 

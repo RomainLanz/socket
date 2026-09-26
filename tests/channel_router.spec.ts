@@ -59,6 +59,19 @@ test.group('channel router', () => {
     assert.deepEqual(matched?.params, {})
   })
 
+  test('router keeps decoded wildcard params slash-separated', ({ assert }) => {
+    class FilesChannel extends BaseChannel {
+      static pattern = 'files/*'
+    }
+
+    const router = new ChannelRouter()
+    router.register(FilesChannel as any)
+
+    assert.deepEqual(router.match('files/images/ada%20lovelace.png')?.params, {
+      '*': 'images/ada lovelace.png',
+    })
+  })
+
   test('router preserves registration order for equally specific channels', ({ assert }) => {
     class FirstChannel extends BaseChannel {
       static pattern = 'chat/:roomId'
