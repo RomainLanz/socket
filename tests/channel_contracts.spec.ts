@@ -268,6 +268,74 @@ test.group('channel contracts', () => {
     )
   })
 
+  test('rejects events named after Object.prototype members', async ({ assert }) => {
+    class SecretChannel extends BaseChannel {
+      static pattern = 'secret'
+      secret = 'sk_live_SECRET'
+    }
+
+    for (const event of ['valueOf', 'constructor', 'toString', 'hasOwnProperty', '__proto__']) {
+      await assert.rejects(
+        () => new SecretChannel().$handleMessage({} as AuthenticatedSocket, event, undefined),
+        `Unknown channel event: ${event}`
+      )
+    }
+  })
+
+  test('dispatches handlers explicitly named after Object.prototype members', async ({
+    assert,
+  }) => {
+    class NamedChannel extends BaseChannel {
+      static pattern = 'named'
+
+      @onMessage('toString')
+      describe(_socket: AuthenticatedSocket<unknown>, _data: undefined) {
+        return 'described'
+      }
+    }
+
+    const result = await new NamedChannel().$handleMessage(
+      {} as AuthenticatedSocket,
+      'toString',
+      undefined
+    )
+
+    assert.equal(result, 'described')
+  })
+
+  test('dispatches inherited handlers and lets child handlers override them', async ({
+    assert,
+  }) => {
+    class ParentChannel extends BaseChannel {
+      static pattern = 'parent'
+
+      @onMessage('inherited')
+      inherited(_socket: AuthenticatedSocket<unknown>, _data: undefined) {
+        return 'parent'
+      }
+
+      @onMessage('overridden')
+      overridden(_socket: AuthenticatedSocket<unknown>, _data: undefined) {
+        return 'parent'
+      }
+    }
+
+    class ChildChannel extends ParentChannel {
+      static pattern = 'child'
+
+      @onMessage('overridden')
+      childOverridden(_socket: AuthenticatedSocket<unknown>, _data: undefined) {
+        return 'child'
+      }
+    }
+
+    const channel = new ChildChannel()
+    const socket = {} as AuthenticatedSocket
+
+    assert.equal(await channel.$handleMessage(socket, 'inherited', undefined), 'parent')
+    assert.equal(await channel.$handleMessage(socket, 'overridden', undefined), 'child')
+  })
+
   test('constructs concrete names from explicit patterns and parameters', ({ assert }) => {
     const socket = new Socket<AppSocket>()
 

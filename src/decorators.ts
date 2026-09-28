@@ -48,7 +48,8 @@ export function getDecoratedChannelHandlers<User = unknown>(
     proto = Object.getPrototypeOf(proto)
   }
 
-  const handlers: Record<string, unknown> = {}
+  // Event names come from clients: without a prototype, only decorated events resolve.
+  const handlers: Record<string, unknown> = Object.create(null)
 
   for (const constructor of constructors) {
     const definitions = decoratedHandlers.get(constructor) ?? []
