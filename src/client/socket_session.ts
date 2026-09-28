@@ -2,6 +2,16 @@ import type { ConnectionState, EventHandler } from './types.js'
 import { SERVER_DISCONNECT_CODE, type ServerProtocolMessage } from '../shared_types.js'
 import { callClientHandler } from './callback.js'
 
+/** Close code browsers report when a connection fails without a close frame. */
+const ABNORMAL_CLOSURE_CODE = 1006
+
+/** React Native has no global CloseEvent, so fall back to an object with the same fields. */
+function abnormalClosureEvent(): CloseEvent {
+  const init = { code: ABNORMAL_CLOSURE_CODE, reason: '', wasClean: false }
+  if (typeof CloseEvent === 'function') return new CloseEvent('close', init)
+  return { type: 'close', ...init } as CloseEvent
+}
+
 type Callable = (...args: never[]) => unknown
 type IncomingMessage = Extract<ServerProtocolMessage, { type: 'ack' | 'event' }>
 
@@ -113,7 +123,7 @@ export class ClientSocketSession {
     return connection
   }
 
-  #startConnection(reconnectAttempt: number): Promise<void> {
+  #startConnection(reconnectAttempt: number, automatic = false): Promise<void> {
     const deferred = Promise.withResolvers<void>()
     const opening: ClientSocketLifecycle = { kind: 'opening', deferred, reconnectAttempt }
     this.#setLifecycle(opening)
@@ -123,8 +133,10 @@ export class ClientSocketSession {
     try {
       socket = this.#createWebSocket(this.#buildUrl())
     } catch (error) {
-      this.#setLifecycle({ kind: 'disconnected', reconnectAttempt })
+      const disconnected: DisconnectedLifecycle = { kind: 'disconnected', reconnectAttempt }
+      this.#setLifecycle(disconnected)
       deferred.reject(error)
+      if (automatic) this.#retryAfterAbnormalClosure(disconnected)
       return deferred.promise
     }
 
@@ -166,7 +178,15 @@ export class ClientSocketSession {
 
       cleanup()
       deferred.reject(new Error('WebSocket connection failed'))
-      this.#setLifecycle({ kind: 'failed', connection, reconnectAttempt })
+      const failed: ClientSocketLifecycle = { kind: 'failed', connection, reconnectAttempt }
+      this.#setLifecycle(failed)
+      if (!automatic || !this.#isCurrent(failed)) return
+
+      // Some environments never follow the error with a close event: end the attempt now.
+      const disconnected: DisconnectedLifecycle = { kind: 'disconnected', reconnectAttempt }
+      this.#setLifecycle(disconnected)
+      socket.close()
+      this.#retryAfterAbnormalClosure(disconnected)
     }
 
     socket.addEventListener('open', handleOpen)
@@ -374,26 +394,17 @@ export class ClientSocketSession {
       timer: setTimeout(() => {
         if (this.#lifecycle !== waiting) return
 
-        this.#startConnection(waiting.reconnectAttempt).catch(() => {
-          if (this.#lifecycle.kind === 'failed') {
-            const failed = this.#lifecycle
-            const disconnected: DisconnectedLifecycle = {
-              kind: 'disconnected',
-              reconnectAttempt: failed.reconnectAttempt,
-            }
-            this.#setLifecycle(disconnected)
-            failed.connection.socket.close()
-            if (this.#isCurrent(disconnected)) this.#scheduleReconnect(disconnected)
-            return
-          }
-
-          if (this.#lifecycle.kind === 'disconnected') {
-            this.#scheduleReconnect(this.#lifecycle)
-          }
-        })
+        // Failures decide on retries where they happen; the rejection only reaches connect() callers.
+        this.#startConnection(waiting.reconnectAttempt, true).catch(() => {})
       }, delay),
     }
     this.#setLifecycle(waiting)
+  }
+
+  #retryAfterAbnormalClosure(disconnected: DisconnectedLifecycle): void {
+    if (this.#isCurrent(disconnected) && this.#shouldReconnect(abnormalClosureEvent())) {
+      this.#scheduleReconnect(disconnected)
+    }
   }
 
   get #connection(): SocketConnection | undefined {

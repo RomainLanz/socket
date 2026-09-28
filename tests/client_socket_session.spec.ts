@@ -430,6 +430,178 @@ test.group('client socket session', () => {
     session.disconnect()
   })
 
+  test('keeps manual disconnect terminal during an automatic retry', async ({ assert, cleanup }) => {
+    const sockets: FakeWebSocket[] = []
+    const session = new ClientSocketSession({
+      buildUrl: () => 'ws://localhost/socket',
+      reconnectDelay: 0,
+      reconnectMaxDelay: 0,
+      createWebSocket(url) {
+        const socket = new FakeWebSocket(url)
+        sockets.push(socket)
+        return socket as unknown as WebSocket
+      },
+    })
+    cleanup(() => session.disconnect())
+
+    const initial = session.connect()
+    sockets[0].emit('open')
+    await initial
+    sockets[0].emitClose(SERVICE_RESTART_CODE)
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    assert.lengthOf(sockets, 2)
+    assert.equal(session.state, 'connecting')
+
+    session.disconnect()
+    await new Promise((resolve) => setTimeout(resolve, 20))
+
+    assert.lengthOf(sockets, 2)
+    assert.equal(session.state, 'disconnected')
+  })
+
+  test('consults shouldReconnect when an automatic retry errors before closing', async ({
+    assert,
+    cleanup,
+  }) => {
+    const sockets: FakeWebSocket[] = []
+    const codes: Array<number | undefined> = []
+    const session = new ClientSocketSession({
+      buildUrl: () => 'ws://localhost/socket',
+      reconnectDelay: 0,
+      reconnectMaxDelay: 0,
+      shouldReconnect(event) {
+        codes.push(event.code)
+        return codes.length === 1
+      },
+      createWebSocket(url) {
+        const socket = new FakeWebSocket(url)
+        sockets.push(socket)
+        return socket as unknown as WebSocket
+      },
+    })
+    cleanup(() => session.disconnect())
+
+    const initial = session.connect()
+    sockets[0].emit('open')
+    await initial
+    sockets[0].emitClose(1001)
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    assert.lengthOf(sockets, 2)
+
+    sockets[1].emit('error')
+    await Promise.resolve()
+    sockets[1].emitClose(1006)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+
+    assert.deepEqual(codes, [1001, 1006])
+    assert.lengthOf(sockets, 2)
+    assert.equal(session.state, 'disconnected')
+  })
+
+  test('consults shouldReconnect when an automatic retry closes without an error', async ({
+    assert,
+    cleanup,
+  }) => {
+    const sockets: FakeWebSocket[] = []
+    const session = new ClientSocketSession({
+      buildUrl: () => 'ws://localhost/socket',
+      reconnectDelay: 0,
+      reconnectMaxDelay: 0,
+      shouldReconnect: (event) => event.code !== 1006,
+      createWebSocket(url) {
+        const socket = new FakeWebSocket(url)
+        sockets.push(socket)
+        return socket as unknown as WebSocket
+      },
+    })
+    cleanup(() => session.disconnect())
+
+    const initial = session.connect()
+    sockets[0].emit('open')
+    await initial
+    sockets[0].emitClose(1001)
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    assert.lengthOf(sockets, 2)
+
+    sockets[1].emitClose(1006)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+
+    assert.lengthOf(sockets, 2)
+    assert.equal(session.state, 'disconnected')
+  })
+
+  test('consults shouldReconnect when an automatic retry cannot create a WebSocket', async ({
+    assert,
+    cleanup,
+  }) => {
+    const sockets: FakeWebSocket[] = []
+    const codes: Array<number | undefined> = []
+    const session = new ClientSocketSession({
+      buildUrl: () => 'ws://localhost/socket',
+      reconnectDelay: 0,
+      reconnectMaxDelay: 0,
+      shouldReconnect(event) {
+        codes.push(event.code)
+        return codes.length === 1
+      },
+      createWebSocket(url) {
+        if (sockets.length === 1) {
+          throw new Error('WebSocket unavailable')
+        }
+
+        const socket = new FakeWebSocket(url)
+        sockets.push(socket)
+        return socket as unknown as WebSocket
+      },
+    })
+    cleanup(() => session.disconnect())
+
+    const initial = session.connect()
+    sockets[0].emit('open')
+    await initial
+    sockets[0].emitClose(1001)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+
+    assert.deepEqual(codes, [1001, 1006])
+    assert.equal(session.state, 'disconnected')
+  })
+
+  test('reports abnormal closures without a global CloseEvent', async ({ assert, cleanup }) => {
+    const closeEvent = globalThis.CloseEvent
+    Reflect.deleteProperty(globalThis, 'CloseEvent')
+    cleanup(() => {
+      globalThis.CloseEvent = closeEvent
+    })
+
+    const sockets: FakeWebSocket[] = []
+    const events: Array<Pick<CloseEvent, 'code' | 'wasClean'>> = []
+    const session = new ClientSocketSession({
+      buildUrl: () => 'ws://localhost/socket',
+      reconnectDelay: 0,
+      reconnectMaxDelay: 0,
+      shouldReconnect(event) {
+        events.push({ code: event.code, wasClean: event.wasClean })
+        return events.length === 1
+      },
+      createWebSocket(url) {
+        const socket = new FakeWebSocket(url)
+        sockets.push(socket)
+        return socket as unknown as WebSocket
+      },
+    })
+    cleanup(() => session.disconnect())
+
+    const initial = session.connect()
+    sockets[0].emit('open')
+    await initial
+    sockets[0].emitClose(1001)
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    sockets[1].emit('error')
+
+    assert.deepEqual(events[1], { code: 1006, wasClean: false })
+    assert.equal(session.state, 'disconnected')
+  })
+
   test('cancels a scheduled retry when connect is called manually', async ({ assert }) => {
     const sockets: FakeWebSocket[] = []
     const session = new ClientSocketSession({
