@@ -31,7 +31,7 @@ test.group('configure', () => {
     } as unknown as Parameters<typeof configure>[0])
 
     assert.deepEqual(calls, [
-      ['addProvider', '@rlanz/socket/provider', ['web']],
+      ['addProvider', '@rlanz/socket/provider', ['web', 'test']],
       ['addAssemblerHook', 'init', '@rlanz/socket/assembler_hook'],
       ['addImportAlias', '#channels/*', './app/channels/*.js'],
       ['createDirectory', 'app/channels'],

@@ -24,9 +24,9 @@ yarn add @rlanz/socket
 node ace configure @rlanz/socket
 ```
 
-The configure command registers the provider in the `web` environment and adds the Assembler hook
-that discovers channels and generates client types. It also creates `app/channels` and adds the
-`#channels/*` import alias to `package.json`.
+The configure command registers the provider in the `web` and `test` environments and adds the
+Assembler hook that discovers channels and generates client types. It also creates `app/channels`
+and adds the `#channels/*` import alias to `package.json`.
 
 ```json
 {
@@ -42,7 +42,7 @@ export default defineConfig({
   providers: [
     {
       file: () => import('@rlanz/socket/provider'),
-      environment: ['web'],
+      environment: ['web', 'test'],
     },
   ],
   hooks: {
@@ -299,7 +299,7 @@ export default defineConfig({
   providers: [
     {
       file: () => import('@rlanz/socket/provider'),
-      environment: ['web'],
+      environment: ['web', 'test'],
     },
   ],
   hooks: {
@@ -664,6 +664,10 @@ socket lifecycle.
 
 `socket.fake()` captures outgoing events without writing to WebSocket clients or the distributed
 transport.
+
+The provider must be registered in the `test` environment for `@rlanz/socket/services/main` to load
+in tests. Under `node ace test`, it starts before the HTTP server, so it logs a warning and does not
+start the WebSocket server.
 
 ```ts
 import { test } from '@japa/runner'

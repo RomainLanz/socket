@@ -5,7 +5,7 @@ export async function configure(command: Pick<ConfigureCommand, 'createCodemods'
   const codemods = await command.createCodemods()
 
   await codemods.updateRcFile((rcFile) => {
-    rcFile.addProvider('@rlanz/socket/provider', ['web'])
+    rcFile.addProvider('@rlanz/socket/provider', ['web', 'test'])
     rcFile.addAssemblerHook('init', '@rlanz/socket/assembler_hook')
   })
 
