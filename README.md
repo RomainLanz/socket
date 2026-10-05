@@ -25,7 +25,16 @@ node ace configure @rlanz/socket
 ```
 
 The configure command registers the provider in the `web` environment and adds the Assembler hook
-that discovers channels and generates client types.
+that discovers channels and generates client types. It also creates `app/channels` and adds the
+`#channels/*` import alias to `package.json`.
+
+```json
+{
+  "imports": {
+    "#channels/*": "./app/channels/*.js"
+  }
+}
+```
 
 ```ts
 // adonisrc.ts
@@ -253,6 +262,9 @@ This alias is separate from the AdonisJS server mapping for `#generated/*`.
 Keep the standard AdonisJS `#generated/*` mapping pointed at `./.adonisjs/server/*.js`. The provider
 uses it to load the generated channel manifest.
 
+Generated files import channels through the `#channels/*` alias. Applications configured with
+version 0.2.x or earlier must add it to `package.json` themselves.
+
 The generator recognizes:
 
 - default-exported classes that directly extend `BaseChannel`
@@ -277,6 +289,7 @@ export default generateSocketRegistry({
   source: './app/realtime',
   glob: ['**/*.ts'],
   output: '.adonisjs/client/socket.d.ts',
+  importAlias: '#realtime',
 })
 ```
 
@@ -295,8 +308,8 @@ export default defineConfig({
 })
 ```
 
-Any source directory inside `app` is supported. Generated imports use the matching AdonisJS `#app`
-alias without TypeScript extensions.
+When `source` changes, set `importAlias` to a `package.json` import alias that points to it, such
+as `"#realtime/*": "./app/realtime/*.js"`. Generated imports omit TypeScript extensions.
 
 ### Dependency injection
 

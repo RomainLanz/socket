@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 import ts from 'typescript'
 import { test } from '@japa/runner'
 import { generateSocketRegistry } from '../src/assembler_hook.js'
@@ -59,7 +60,7 @@ function generate(files: { name: string; source: string }[]) {
     { asList: () => Object.fromEntries(paths.map((filePath, index) => [String(index), filePath])) },
     buffer,
     config,
-    { toImportPath: (filePath: string) => `#app/channels/${path.basename(filePath, '.ts')}` }
+    { toImportPath: (filePath: string) => `#channels/${path.basename(filePath, '.ts')}` }
   )
   fs.rmSync(root, { recursive: true })
   return buffer.toString()
@@ -133,10 +134,10 @@ test.group('assembler hook', () => {
     assert.include(output, `readonly 'chat:send': 'sendMessage'`)
     assert.include(output, `readonly 'alerts:read': 'read'`)
     assert.isBelow(
-      output.indexOf('#app/channels/chat_channel'),
-      output.indexOf('#app/channels/alerts_channel')
+      output.indexOf('#channels/chat_channel'),
+      output.indexOf('#channels/alerts_channel')
     )
-    assert.include(output, `readonly channel: typeof import('#app/channels/chat_channel').default`)
+    assert.include(output, `readonly channel: typeof import('#channels/chat_channel').default`)
     const generatedSource = ts.createSourceFile(
       'socket.ts',
       output,
@@ -152,6 +153,7 @@ test.group('assembler hook', () => {
       source: './app/realtime',
       glob: ['**/*.socket.ts'],
       output: '.adonisjs/socket.ts',
+      importAlias: '#realtime',
     }) as { run: (...args: any[]) => void }
 
     hook.run(
@@ -170,23 +172,78 @@ test.group('assembler hook', () => {
     assert.equal(clientConfig.source, './app/realtime')
     assert.deepEqual(clientConfig.glob, ['**/*.socket.ts'])
     assert.equal(clientConfig.output, '.adonisjs/socket.ts')
-    assert.equal(clientConfig.importAlias, '#app/realtime')
+    assert.equal(clientConfig.importAlias, '#realtime')
     assert.equal(serverConfig.source, './app/realtime')
     assert.deepEqual(serverConfig.glob, ['**/*.socket.ts'])
     assert.equal(serverConfig.output, './.adonisjs/server/socket_channels.ts')
-    assert.equal(serverConfig.importAlias, '#app/realtime')
+    assert.equal(serverConfig.importAlias, '#realtime')
   })
 
-  test('rejects channel discovery outside the application directory', ({ assert }) => {
-    assert.throws(
-      () =>
-        generateSocketRegistry({ source: './realtime' }).run(
-          null as never,
-          { add() {} } as never,
-          { add() {}, async addFile() {} } as never
-        ),
-      '[socket] Channel source must be inside the app directory'
+  test('imports generated channels through the #channels alias by default', ({ assert }) => {
+    const configs = new Map<string, any>()
+    generateSocketRegistry().run(
+      null as never,
+      { add() {} } as never,
+      {
+        add(name: string, value: unknown) {
+          configs.set(name, value)
+        },
+        async addFile() {},
+      } as never
     )
+
+    assert.equal(configs.get('socketChannels').importAlias, '#channels')
+    assert.equal(configs.get('socketServerChannels').importAlias, '#channels')
+  })
+
+  test('generates a runtime manifest that Node resolves through the app import map', async ({
+    assert,
+    cleanup,
+  }) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'socket-assembler-app-'))
+    cleanup(() => fs.rmSync(root, { recursive: true }))
+    fs.writeFileSync(
+      path.join(root, 'package.json'),
+      JSON.stringify({
+        type: 'module',
+        imports: {
+          '#controllers/*': './app/controllers/*.js',
+          '#generated/*': './.adonisjs/server/*.js',
+          '#channels/*': './app/channels/*.js',
+        },
+      })
+    )
+    const channelPath = path.join(root, 'app/channels/chat_channel.js')
+    fs.mkdirSync(path.dirname(channelPath), { recursive: true })
+    fs.writeFileSync(channelPath, 'export default class ChatChannel {}')
+
+    const configs = new Map<string, any>()
+    generateSocketRegistry().run(
+      null as never,
+      { add() {} } as never,
+      {
+        add(name: string, value: unknown) {
+          configs.set(name, value)
+        },
+        async addFile() {},
+      } as never
+    )
+    const config = configs.get('socketServerChannels')
+    const source = path.join(root, config.source)
+    const buffer = new Buffer()
+    config.as({ asList: () => ({ chat: channelPath }) }, buffer, config, {
+      // Mirrors the Assembler index generator: swap the source directory for the alias.
+      toImportPath: (filePath: string) =>
+        filePath.replace(source, config.importAlias).replace(/\.[^/.]+$/, ''),
+    })
+    const manifestPath = path.join(root, config.output)
+    fs.mkdirSync(path.dirname(manifestPath), { recursive: true })
+    fs.writeFileSync(manifestPath, buffer.toString())
+
+    const { socketChannels } = await import(pathToFileURL(manifestPath).href)
+
+    assert.lengthOf(socketChannels, 1)
+    assert.equal(socketChannels[0].name, 'ChatChannel')
   })
 
   test('generates the runtime manifest from the same channel files', ({ assert }) => {
@@ -210,11 +267,11 @@ test.group('assembler hook', () => {
     configs
       .get('socketServerChannels')
       .as({ asList: () => ({ chat: filePath }) }, buffer, configs.get('socketServerChannels'), {
-        toImportPath: () => '#app/channels/chat_channel.ts',
+        toImportPath: () => '#channels/chat_channel.ts',
       })
     fs.rmSync(root, { recursive: true })
 
-    assert.include(buffer.toString(), `import Channel0 from '#app/channels/chat_channel'`)
+    assert.include(buffer.toString(), `import Channel0 from '#channels/chat_channel'`)
     assert.include(buffer.toString(), 'export const socketChannels = [Channel0] as const')
   })
 
@@ -274,7 +331,7 @@ test.group('assembler hook', () => {
           `import { onMessage } from '@rlanz/socket/decorators'\nexport default class PayloadsChannel`
         ),
       },
-    ]).replaceAll(`'#app/channels/payloads_channel'`, `'./channel.js'`)
+    ]).replaceAll(`'#channels/payloads_channel'`, `'./channel.js'`)
 
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'socket-generated-types-'))
     try {
@@ -349,7 +406,7 @@ test.group('assembler hook', () => {
       },
     ])
 
-    assert.include(output, '// [socket] Omitted #app/channels/dynamic_channel')
+    assert.include(output, '// [socket] Omitted #channels/dynamic_channel')
     assert.notInclude(output, 'readonly channel:')
   })
 

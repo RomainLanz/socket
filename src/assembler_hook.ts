@@ -12,6 +12,8 @@ export interface SocketAssemblerHookOptions {
   source?: string
   glob?: string[]
   output?: string
+  /** Package import alias that points to `source`. Defaults to `#channels`. */
+  importAlias?: string
 }
 
 type Handler = { event: string; method: string }
@@ -35,13 +37,6 @@ function quote(value: string) {
 
 function generatedImportPath(importPath: string): string {
   return importPath.replace(/\.ts$/, '')
-}
-
-function appImportAlias(source: string): string {
-  const normalized = source.replace(/^\.\//, '')
-  if (normalized === 'app') return '#app'
-  if (normalized.startsWith('app/')) return `#app/${normalized.slice('app/'.length)}`
-  throw new Error('[socket] Channel source must be inside the app directory')
 }
 
 function fail(filePath: string, message: string): never {
@@ -276,7 +271,7 @@ export function generateSocketRegistry(
 
       const source = options.source ?? './app/channels'
       const glob = options.glob ?? ['**/*_channel.{ts,js}']
-      const importAlias = appImportAlias(source)
+      const importAlias = options.importAlias ?? '#channels'
 
       indexGenerator.add('socketChannels', {
         source,

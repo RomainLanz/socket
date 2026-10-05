@@ -8,4 +8,7 @@ export async function configure(command: Pick<ConfigureCommand, 'createCodemods'
     rcFile.addProvider('@rlanz/socket/provider', ['web'])
     rcFile.addAssemblerHook('init', '@rlanz/socket/assembler_hook')
   })
+
+  await codemods.addImportAlias('#channels/*', './app/channels/*.js')
+  await codemods.createDirectory('app/channels')
 }
