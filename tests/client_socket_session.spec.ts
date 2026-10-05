@@ -430,7 +430,10 @@ test.group('client socket session', () => {
     session.disconnect()
   })
 
-  test('keeps manual disconnect terminal during an automatic retry', async ({ assert, cleanup }) => {
+  test('keeps manual disconnect terminal during an automatic retry', async ({
+    assert,
+    cleanup,
+  }) => {
     const sockets: FakeWebSocket[] = []
     const session = new ClientSocketSession({
       buildUrl: () => 'ws://localhost/socket',
