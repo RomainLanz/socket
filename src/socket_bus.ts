@@ -186,9 +186,10 @@ export class SocketBus {
     this.#presenceTimeout =
       parseDuration('transport.presenceTimeout', transport.presenceTimeout) ??
       DEFAULT_PRESENCE_TIMEOUT
-    this.#bus = new Bus(transport.driver(), {
-      retryQueue: resolveRetryQueueConfig(transport.retryQueue),
-    })
+    // Validate before creating the transport: a driver opens its connections
+    // as soon as it is created, and nothing would close them after a throw.
+    const retryQueue = resolveRetryQueueConfig(transport.retryQueue)
+    this.#bus = new Bus(transport.driver(), { retryQueue })
   }
 
   async start(): Promise<void> {

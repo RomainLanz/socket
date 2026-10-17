@@ -38,15 +38,23 @@ function makeFlakyTransport() {
 }
 
 test.group('SocketBus', () => {
-  test('rejects invalid retry queue limits', ({ assert }) => {
+  test('rejects invalid retry queue limits before creating a transport', ({ assert }) => {
+    let transports = 0
+    const driver = () => {
+      transports++
+      return memory()()
+    }
+
     assert.throws(
       () =>
         new SocketBus(
-          { driver: memory(), retryQueue: { maxSize: 0 } },
+          { driver, retryQueue: { maxSize: 0 } },
           { channel() {}, broadcast() {}, presenceSockets: () => [] }
         ),
       'transport.retryQueue.maxSize must be a positive integer or null'
     )
+    // A transport created before the throw would hold its connections open.
+    assert.equal(transports, 0)
   })
 
   test('bounds failed transport publications by default ({case})')
