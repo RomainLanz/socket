@@ -17,53 +17,58 @@ test.group('SocketBus', () => {
     )
   })
 
-  test('bounds failed transport publications by default', async ({ assert }) => {
-    let reconnect: (() => Promise<void> | void) | undefined
-    let transportAvailable = false
-    const delivered: unknown[] = []
-    const driver = () => {
-      const transport = {
-        setId() {
-          return transport
-        },
-        onReconnect(callback: () => Promise<void> | void) {
-          reconnect = callback
-        },
-        async publish(_channel: string, message: unknown) {
-          if (!transportAvailable) {
-            throw new Error('transport unavailable')
-          }
-          delivered.push(message)
-        },
-        async subscribe() {},
-        async unsubscribe() {},
-        async disconnect() {},
+  test('bounds failed transport publications by default ({case})')
+    .with([
+      { case: 'retryQueue omitted', retryQueue: undefined },
+      { case: 'maxSize undefined', retryQueue: { maxSize: undefined } },
+    ])
+    .run(async ({ assert }, { retryQueue }) => {
+      let reconnect: (() => Promise<void> | void) | undefined
+      let transportAvailable = false
+      const delivered: unknown[] = []
+      const driver = () => {
+        const transport = {
+          setId() {
+            return transport
+          },
+          onReconnect(callback: () => Promise<void> | void) {
+            reconnect = callback
+          },
+          async publish(_channel: string, message: unknown) {
+            if (!transportAvailable) {
+              throw new Error('transport unavailable')
+            }
+            delivered.push(message)
+          },
+          async subscribe() {},
+          async unsubscribe() {},
+          async disconnect() {},
+        }
+
+        return transport
       }
+      const bus = new SocketBus(
+        { driver: driver as any, retryQueue },
+        { channel() {}, broadcast() {}, presenceSockets: () => [] }
+      )
 
-      return transport
-    }
-    const bus = new SocketBus(
-      { driver: driver as any },
-      { channel() {}, broadcast() {}, presenceSockets: () => [] }
-    )
+      for (let index = 0; index <= DEFAULT_RETRY_QUEUE_MAX_SIZE; index++) {
+        bus.publishBroadcast(`event:${index}`, null)
+      }
+      await new Promise<void>((resolve) => setImmediate(resolve))
 
-    for (let index = 0; index <= DEFAULT_RETRY_QUEUE_MAX_SIZE; index++) {
-      bus.publishBroadcast(`event:${index}`, null)
-    }
-    await new Promise<void>((resolve) => setImmediate(resolve))
+      transportAvailable = true
+      await reconnect?.()
 
-    transportAvailable = true
-    await reconnect?.()
+      assert.lengthOf(delivered, DEFAULT_RETRY_QUEUE_MAX_SIZE)
+      assert.equal((delivered[0] as any).event, 'event:1')
+      assert.equal(
+        (delivered[DEFAULT_RETRY_QUEUE_MAX_SIZE - 1] as any).event,
+        `event:${DEFAULT_RETRY_QUEUE_MAX_SIZE}`
+      )
 
-    assert.lengthOf(delivered, DEFAULT_RETRY_QUEUE_MAX_SIZE)
-    assert.equal((delivered[0] as any).event, 'event:1')
-    assert.equal(
-      (delivered[DEFAULT_RETRY_QUEUE_MAX_SIZE - 1] as any).event,
-      `event:${DEFAULT_RETRY_QUEUE_MAX_SIZE}`
-    )
-
-    await bus.close()
-  })
+      await bus.close()
+    })
 
   test('passes an explicit retry queue limit to the transport bus', async ({ assert }) => {
     let reconnect: (() => Promise<void> | void) | undefined

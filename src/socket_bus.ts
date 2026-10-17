@@ -84,8 +84,8 @@ function resolveRetryQueueConfig(config: SocketRetryQueueConfig | undefined) {
 
   return {
     enabled: true,
-    maxSize,
     ...config,
+    maxSize,
   }
 }
 
