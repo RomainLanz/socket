@@ -127,7 +127,8 @@ void [new Socket(options), success, failure, contradictorySuccess, missingError]
       '@adonisjs/assembler@^8.0.0',
       '@adonisjs/core@^7.0.1',
       '@opentelemetry/api@^1.9.0',
-      '@opentelemetry/instrumentation@^0.200.0',
+      // @adonisjs/otel depends on ^0.213.0, so the peer range must accept newer releases.
+      '@opentelemetry/instrumentation@^0.213.0',
       'react@^19.0.0',
       '@types/react@^19.0.0',
       '@types/node@^24.0.0',
