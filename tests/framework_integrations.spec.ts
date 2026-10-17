@@ -1,7 +1,7 @@
 import { test } from '@japa/runner'
-import { StrictMode, createElement, useLayoutEffect } from 'react'
+import { StrictMode, createElement, useEffect, useLayoutEffect } from 'react'
 import { act, create, type ReactTestRenderer } from 'react-test-renderer'
-import { computed } from 'vue'
+import { computed, createRenderer, defineComponent, h, onMounted, onUnmounted, watch } from 'vue'
 import { BaseChannel } from '../src/base_channel.js'
 import { Channel } from '../src/client/channel.js'
 import { acquireChannel, acquireSocketOwnership } from '../src/client/framework.js'
@@ -358,6 +358,68 @@ class BrowserWebSocket {
   }
 }
 
+/** Replaces the global WebSocket with BrowserWebSocket doubles. */
+function installBrowserWebSocket(): { browserSockets: BrowserWebSocket[]; restore: () => void } {
+  const runtime = globalThis as unknown as { WebSocket: unknown }
+  const OriginalWebSocket = runtime.WebSocket
+  const browserSockets: BrowserWebSocket[] = []
+  runtime.WebSocket = class extends BrowserWebSocket {
+    constructor() {
+      super()
+      browserSockets.push(this)
+    }
+  }
+  return {
+    browserSockets,
+    restore: () => {
+      runtime.WebSocket = OriginalWebSocket
+    },
+  }
+}
+
+function presenceUpdate(channel: string) {
+  return {
+    channel,
+    users: [{ id: 'user-1', joinedAt: '2026-01-01T00:00:00.000Z' }],
+    count: 1,
+  }
+}
+
+/**
+ * Mounts a component that provides `socket` to a child running `setup`,
+ * with a renderer that creates no DOM.
+ */
+function mountVue(socket: Socket<AppSocket>, setup: () => void): { unmount: () => void } {
+  const renderer = createRenderer<object, object>({
+    insert() {},
+    remove() {},
+    createElement: () => ({}),
+    createText: () => ({}),
+    createComment: () => ({}),
+    setText() {},
+    setElementText() {},
+    parentNode: () => null,
+    nextSibling: () => null,
+    patchProp() {},
+  })
+  const Child = defineComponent({
+    setup() {
+      setup()
+      return () => null
+    },
+  })
+  const app = renderer.createApp(
+    defineComponent({
+      setup() {
+        vue.provideSocket(socket)
+        return () => h(Child)
+      },
+    })
+  )
+  app.mount({})
+  return { unmount: () => app.unmount() }
+}
+
 test.group('framework channel lifecycle', () => {
   test('shares subscriptions and listeners until the final lease is released', async ({
     assert,
@@ -676,7 +738,7 @@ test.group('framework channel lifecycle', () => {
     socket.disconnect()
   })
 
-  test('clears direct intent on disconnect while preserving managed identity', async ({
+  test('clears direct intent on disconnect while a lease keeps the channel and its callbacks', async ({
     assert,
     cleanup,
   }) => {
@@ -714,7 +776,7 @@ test.group('framework channel lifecycle', () => {
     await secondConnection
     await flushTransitions()
     browserSockets[1].serverEvent('chat/general', 'message', null)
-    assert.equal(directCalls, 0)
+    assert.equal(directCalls, 1)
     assert.equal(frameworkCalls, 1)
     assert.deepEqual(browserSockets[1].requests, ['subscribe'])
 
@@ -849,6 +911,208 @@ test.group('framework channel lifecycle', () => {
     await act(async () => renderer.unmount())
     await flushTransitions()
     assert.isFalse(published!.subscribed)
+    socket.disconnect()
+  })
+
+  test('React keeps whisper and here() callbacks of a leased channel across disconnect', async ({
+    assert,
+    cleanup,
+  }) => {
+    const { browserSockets, restore } = installBrowserWebSocket()
+    const runtime = globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT?: boolean }
+    const originalActEnvironment = runtime.IS_REACT_ACT_ENVIRONMENT
+    runtime.IS_REACT_ACT_ENVIRONMENT = true
+    cleanup(() => {
+      restore()
+      runtime.IS_REACT_ACT_ENVIRONMENT = originalActEnvironment
+    })
+
+    const socket = new Socket<AppSocket>({ url: 'ws://example.test', autoReconnect: false })
+    const connection = socket.connect()
+    browserSockets[0].open()
+    await connection
+    const received = { whispers: 0, here: 0 }
+
+    function Room() {
+      const channel = react.useChannel('chat/:room', { room: 'general' })
+      useEffect(() => {
+        channel?.listenForWhisper('typing', () => received.whispers++)
+        channel?.here(() => received.here++)
+      }, [channel])
+      return null
+    }
+
+    let renderer!: ReactTestRenderer
+    await act(async () => {
+      renderer = create(createElement(react.SocketProvider, { socket }, createElement(Room)))
+    })
+    await flushTransitions()
+
+    socket.disconnect()
+    const reconnection = socket.connect()
+    browserSockets[1].open()
+    await reconnection
+    await flushTransitions()
+    browserSockets[1].serverEvent('chat/general', 'client:typing', { typing: true })
+    browserSockets[1].serverEvent('chat/general', 'presence:update', presenceUpdate('chat/general'))
+
+    assert.deepEqual(received, { whispers: 1, here: 1 })
+    await act(async () => renderer.unmount())
+    socket.disconnect()
+  })
+
+  test('Vue keeps whisper and here() callbacks of a leased channel across disconnect', async ({
+    assert,
+    cleanup,
+  }) => {
+    const { browserSockets, restore } = installBrowserWebSocket()
+    cleanup(restore)
+
+    const socket = new Socket<AppSocket>({ url: 'ws://example.test', autoReconnect: false })
+    const connection = socket.connect()
+    browserSockets[0].open()
+    await connection
+    const received = { whispers: 0, here: 0 }
+
+    const app = mountVue(socket, () => {
+      const channel = vue.useChannel('chat/:room', { room: 'general' })
+      watch(
+        channel,
+        (current) => {
+          current?.listenForWhisper('typing', () => received.whispers++)
+          current?.here(() => received.here++)
+        },
+        { immediate: true }
+      )
+    })
+    await flushTransitions()
+
+    socket.disconnect()
+    const reconnection = socket.connect()
+    browserSockets[1].open()
+    await reconnection
+    await flushTransitions()
+    browserSockets[1].serverEvent('chat/general', 'client:typing', { typing: true })
+    browserSockets[1].serverEvent('chat/general', 'presence:update', presenceUpdate('chat/general'))
+
+    assert.deepEqual(received, { whispers: 1, here: 1 })
+    app.unmount()
+    socket.disconnect()
+  })
+
+  test('React stops a legacy component that unsubscribes from a channel a hook also holds', async ({
+    assert,
+    cleanup,
+  }) => {
+    const { browserSockets, restore } = installBrowserWebSocket()
+    const runtime = globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT?: boolean }
+    const originalActEnvironment = runtime.IS_REACT_ACT_ENVIRONMENT
+    runtime.IS_REACT_ACT_ENVIRONMENT = true
+    cleanup(() => {
+      restore()
+      runtime.IS_REACT_ACT_ENVIRONMENT = originalActEnvironment
+    })
+
+    const socket = new Socket<AppSocket>({ url: 'ws://example.test', autoReconnect: false })
+    const connection = socket.connect()
+    browserSockets[0].open()
+    await connection
+    const received = { hook: 0, legacy: 0 }
+
+    function Feed() {
+      react.useChannelEvent('chat/:room', { room: 'general' }, 'message', () => received.hook++)
+      return null
+    }
+
+    function Legacy() {
+      useEffect(() => {
+        const channel = socket.channel('chat/:room', { room: 'general' })
+        channel.listen('message', () => received.legacy++)
+        channel.subscribe().catch(() => {})
+        return () => void channel.unsubscribe().catch(() => {})
+      }, [])
+      return null
+    }
+
+    const render = (legacy: boolean) =>
+      createElement(
+        react.SocketProvider,
+        { socket },
+        createElement(Feed),
+        legacy ? createElement(Legacy) : null
+      )
+    const counts: number[] = []
+    const deliver = () => {
+      const before = received.legacy
+      browserSockets[0].serverEvent('chat/general', 'message', null)
+      counts.push(received.legacy - before)
+    }
+
+    let renderer!: ReactTestRenderer
+    await act(async () => {
+      renderer = create(render(true))
+    })
+    await flushTransitions()
+    deliver()
+    await act(async () => renderer.update(render(false)))
+    await flushTransitions()
+    deliver()
+    await act(async () => renderer.update(render(true)))
+    await flushTransitions()
+    deliver()
+
+    assert.deepEqual(counts, [1, 0, 1])
+    assert.equal(received.hook, 3)
+    await act(async () => renderer.unmount())
+    socket.disconnect()
+  })
+
+  test('Vue stops a legacy component that unsubscribes from a channel a hook also holds', async ({
+    assert,
+    cleanup,
+  }) => {
+    const { browserSockets, restore } = installBrowserWebSocket()
+    cleanup(restore)
+
+    const socket = new Socket<AppSocket>({ url: 'ws://example.test', autoReconnect: false })
+    const connection = socket.connect()
+    browserSockets[0].open()
+    await connection
+    const received = { hook: 0, legacy: 0 }
+
+    const feed = mountVue(socket, () => {
+      vue.useChannelEvent('chat/:room', { room: 'general' }, 'message', () => received.hook++)
+    })
+    const mountLegacy = () =>
+      mountVue(socket, () => {
+        const channel = socket.channel('chat/:room', { room: 'general' })
+        onMounted(() => {
+          channel.listen('message', () => received.legacy++)
+          channel.subscribe().catch(() => {})
+        })
+        onUnmounted(() => void channel.unsubscribe().catch(() => {}))
+      })
+    const counts: number[] = []
+    const deliver = () => {
+      const before = received.legacy
+      browserSockets[0].serverEvent('chat/general', 'message', null)
+      counts.push(received.legacy - before)
+    }
+
+    let legacy = mountLegacy()
+    await flushTransitions()
+    deliver()
+    legacy.unmount()
+    await flushTransitions()
+    deliver()
+    legacy = mountLegacy()
+    await flushTransitions()
+    deliver()
+
+    assert.deepEqual(counts, [1, 0, 1])
+    assert.equal(received.hook, 3)
+    legacy.unmount()
+    feed.unmount()
     socket.disconnect()
   })
 })

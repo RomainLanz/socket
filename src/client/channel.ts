@@ -393,6 +393,16 @@ export class Channel<Contract> {
   }
 
   /**
+   * Drops direct subscription intent on socket.disconnect() while a
+   * framework lease holds the channel. Callbacks stay registered: the lease
+   * keeps the channel subscribed across reconnects.
+   * @internal
+   */
+  $dropDirectIntent(): void {
+    this.#subscribed = false
+  }
+
+  /**
    * Settles the channel to a terminal local state after socket.disconnect()
    * evicts it. The connection, and with it the remote subscription, is gone,
    * so a later unsubscribe() must not send a frame on the next connection.

@@ -581,7 +581,9 @@ socket.disconnect()
 `disconnect()` unsubscribes every channel and clears its handlers, like `leave()`. After
 connecting again, call `socket.channel()` to get a fresh channel and register its handlers. An
 instance released by `disconnect()` rejects `subscribe()`, and its `unsubscribe()` resolves without
-contacting the server.
+contacting the server. Channels held by a React or Vue hook are the exception: they stay cached with
+their `listen()`, `listenForWhisper()`, and `here()` callbacks and resubscribe on the next
+connection.
 
 Automatic reconnection uses exponential backoff with jitter. The first retry waits between `125ms`
 and `250ms`; later retries double the upper bound up to `5s`. After reconnecting, the client
@@ -660,6 +662,13 @@ useChannelEvent('chat/:roomId', { roomId: 'general' }, 'chat:message', (message)
 The adapters share one subscription between consumers of the same channel and release it after the
 last consumer unmounts. React returns `null` until its effect acquires the channel. Vue returns a
 nullable shallow ref.
+
+`socket.channel()` returns the same instance the adapters use. On such a channel, `unsubscribe()`
+clears the `listen()`, `listenForWhisper()`, `here()`, `joining()`, and `leaving()` callbacks of
+every component; `useChannelEvent` handlers are kept. Do not call `subscribe()` or `unsubscribe()`
+directly on a channel an adapter also holds: the adapter owns the subscription, and a direct
+subscription outlives the last adapter consumer. Add and remove your own handlers with `listen()` /
+`stopListening()` and `listenForWhisper()` / `stopListeningForWhisper()`.
 
 Adapters borrow the socket by default and do not connect or disconnect it. Pass `owned` to
 `SocketProvider` or `{ owned: true }` to `provideSocket` only when that framework root owns the
