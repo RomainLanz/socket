@@ -171,6 +171,40 @@ test.group('SocketBus', () => {
     await bus.close()
   })
 
+  test(
+    'drains failed publications when the transport reconnects, not on a timer, with retryInterval {case}'
+  )
+    .with([
+      { case: 'unset', retryInterval: undefined },
+      { case: 'false', retryInterval: false as const },
+      { case: '0', retryInterval: 0 },
+      { case: "'0ms'", retryInterval: '0ms' },
+      { case: "'0s'", retryInterval: '0s' },
+    ])
+    .run(async ({ assert, cleanup }, { retryInterval }) => {
+      const { state, driver } = makeFlakyTransport()
+      const bus = new SocketBus(
+        { driver, retryQueue: { retryInterval } },
+        { channel() {}, broadcast() {}, presenceSockets: () => [] }
+      )
+      cleanup(() => bus.close())
+
+      bus.publishBroadcast('queued', null)
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      state.available = true
+      await new Promise((resolve) => setTimeout(resolve, 1500))
+
+      assert.deepEqual(state.delivered, [])
+
+      // Like the Redis transport's `ready` event once Redis is back.
+      await state.reconnect?.()
+      assert.deepEqual(
+        state.delivered.map((message) => (message as any).event),
+        ['queued']
+      )
+    })
+    .timeout(5000)
+
   test('accepts nested serializable payloads and repeated references', async () => {
     const shared = { enabled: true }
     const bus = new SocketBus(

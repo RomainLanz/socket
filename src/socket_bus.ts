@@ -3,7 +3,7 @@ import { Bus } from '@boringnode/bus'
 import type { Serializable, TransportFactory } from '@boringnode/bus/types/core'
 import type { PresenceSocket } from './presence_manager.js'
 import { PresenceSocketFrame, type SerializablePresenceSocket } from './presence_socket_frame.js'
-import { parseDuration, type Duration } from './duration.js'
+import { parseDuration, toMilliseconds, type Duration } from './duration.js'
 
 export type { SerializablePresenceSocket } from './presence_socket_frame.js'
 
@@ -72,6 +72,11 @@ export interface SocketRetryQueueConfig {
   enabled?: boolean
   removeDuplicates?: boolean
   maxSize?: number | null
+  /**
+   * Also retries queued publications on this interval. The queue is always
+   * retried when the transport reconnects. A zero duration, such as `0` or
+   * `'0s'`, disables the interval like false.
+   */
   retryInterval?: Duration | false
 }
 
@@ -82,10 +87,18 @@ function resolveRetryQueueConfig(config: SocketRetryQueueConfig | undefined) {
     throw new Error('transport.retryQueue.maxSize must be a positive integer or null')
   }
 
+  const interval = config?.retryInterval
+  // A zero interval reads as "no periodic retry", so it is an alias of false.
+  const retryInterval =
+    interval === false || (interval !== undefined && toMilliseconds(interval) === 0)
+      ? (false as const)
+      : parseDuration('transport.retryQueue.retryInterval', interval)
+
   return {
     enabled: true,
     ...config,
     maxSize,
+    retryInterval,
   }
 }
 
