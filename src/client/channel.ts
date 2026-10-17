@@ -102,6 +102,11 @@ export class Channel<Contract> {
   #boundDisconnectHandler: (() => void) | null = null
   #managedSubscriptions = 0
 
+  /**
+   * Set once socket.disconnect() drops this instance from the socket cache.
+   */
+  #evicted = false
+
   constructor(name: string, transport: SocketClientTransport) {
     this.name = name
     this.#transport = transport
@@ -251,6 +256,12 @@ export class Channel<Contract> {
    *     events ready     presence sync      send/listen
    */
   async subscribe(options: SubscribeOptions = {}): Promise<this> {
+    if (this.#evicted) {
+      throw new Error(
+        `Channel "${this.name}" was released by socket.disconnect(). Use socket.channel() to get a new instance`
+      )
+    }
+
     this.#subscribed = true
     return this.#ensureSubscribed(options)
   }
@@ -379,6 +390,17 @@ export class Channel<Contract> {
     this.#subscribed = false
     this.#clearUserCallbacks()
     return this.#unsubscribeIfUnused(options)
+  }
+
+  /**
+   * Settles the channel to a terminal local state after socket.disconnect()
+   * evicts it. The connection, and with it the remote subscription, is gone,
+   * so a later unsubscribe() must not send a frame on the next connection.
+   * @internal
+   */
+  $evict(): void {
+    this.#evicted = true
+    this.#cleanupTerminal()
   }
 
   #unsubscribeIfUnused(options: UnsubscribeOptions = {}): Promise<void> {

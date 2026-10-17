@@ -884,6 +884,75 @@ test.group('client socket', () => {
     }
   }).timeout(15_000)
 
+  test('delivers events to channel handlers registered after a disconnect', async ({ assert }) => {
+    const messages: string[] = []
+    const httpServer = createServer()
+    const wsServer = createSocketServer(httpServer, (_channelName, reply) => reply.ok())
+    const port = await listen(httpServer)
+    const client = new ClientSocket({ url: `http://127.0.0.1:${port}` })
+
+    try {
+      await client.connect()
+      await client.channel('chat/general').subscribe()
+      client.disconnect()
+
+      const channel = client
+        .channel('chat/general')
+        .listen<{ text: string }>('chat:message', (message) => messages.push(message.text))
+      await client.connect()
+      await channel.subscribe()
+
+      broadcastChannelEvent(wsServer, 'chat/general', 'chat:message', { text: 'hello' })
+      await waitFor(() => messages.length > 0, 1000)
+
+      assert.deepEqual(messages, ['hello'])
+    } finally {
+      client.disconnect()
+      await closeWsServer(wsServer)
+      await closeHttpServer(httpServer)
+    }
+  }).timeout(10_000)
+
+  test('keeps the fresh channel subscribed when a stale reference unsubscribes after disconnect', async ({
+    assert,
+  }) => {
+    class NewsChannel extends BaseChannel {
+      static pattern = 'news'
+    }
+
+    const httpServer = createServer()
+    const socketService = new SocketService()
+    const router = new ChannelRouter()
+    router.register(NewsChannel)
+    await socketService.boot(httpServer, {}, router, { warn() {}, info() {} } as any)
+    const port = await listen(httpServer)
+    const client = new ClientSocket({ url: `http://127.0.0.1:${port}`, autoReconnect: false })
+    const items: unknown[] = []
+
+    try {
+      const stale = client.channel('news')
+      await client.connect()
+      await stale.subscribe()
+      client.disconnect()
+
+      await client.connect()
+      const fresh = client.channel('news').listen('news:item', (item) => items.push(item))
+      await fresh.subscribe()
+
+      await stale.unsubscribe()
+      socketService.to('news').emit('news:item', { id: 1 })
+      await waitFor(() => items.length > 0, 1000)
+
+      assert.deepEqual(items, [{ id: 1 }])
+      assert.equal(socketService.health().channels, 1)
+      await assert.rejects(() => stale.subscribe(), /socket\.channel\(\)/)
+    } finally {
+      client.disconnect()
+      await socketService.close()
+      await closeHttpServer(httpServer)
+    }
+  }).timeout(10_000)
+
   test('stops channel callbacks after explicit unsubscribe', async ({ assert }) => {
     const initialPresence: PresenceData = {
       channel: 'presence/general',

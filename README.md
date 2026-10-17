@@ -578,6 +578,11 @@ socket.disconnect()
 
 `subscribe()` and `unsubscribe()` accept `{ timeout }` in milliseconds. The default is `5000`.
 
+`disconnect()` unsubscribes every channel and clears its handlers, like `leave()`. After
+connecting again, call `socket.channel()` to get a fresh channel and register its handlers. An
+instance released by `disconnect()` rejects `subscribe()`, and its `unsubscribe()` resolves without
+contacting the server.
+
 Automatic reconnection uses exponential backoff with jitter. The first retry waits between `125ms`
 and `250ms`; later retries double the upper bound up to `5s`. After reconnecting, the client
 subscribes again to desired channels. Pending acknowledgements fail and authentication and channel

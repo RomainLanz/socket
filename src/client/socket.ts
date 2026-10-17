@@ -88,9 +88,19 @@ export class Socket<Registry = undefined> implements SocketClientTransport {
     return this.#session.connect()
   }
 
+  /**
+   * Closes the connection and unsubscribes every direct channel consumer.
+   * Unsubscribed channels are evicted: they leave the cache, so a later
+   * channel() call returns a fresh instance, and the evicted instance can
+   * no longer subscribe.
+   */
   disconnect(): void {
-    for (const channel of this.#channels.values()) {
+    for (const [name, channel] of this.#channels) {
       channel.unsubscribe().catch(() => {})
+      if (!channel.subscribed) {
+        channel.$evict()
+        this.#channels.delete(name)
+      }
     }
 
     this.#session.disconnect()
