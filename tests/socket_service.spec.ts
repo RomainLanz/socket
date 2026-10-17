@@ -1914,6 +1914,28 @@ test.group('socket service', () => {
       await closeHttpServer(httpServer)
     }
   })
+
+  test('drops broadcasts sent while the transport is closing', async ({ assert }) => {
+    const { state, driver } = makeQuittingTransport()
+    const httpServer = createServer()
+    const socket = new SocketService()
+    await socket.boot(httpServer, { transport: { driver } }, new ChannelRouter(), makeLogger())
+
+    try {
+      // Application code, such as a queue job, keeps broadcasting during shutdown.
+      const closing = socket.close()
+      await state.disconnectStarted.promise
+      socket.broadcast('maintenance', { active: true })
+      socket.to('chat/general').emit('chat:message', { body: 'late' })
+
+      await closing
+      assert.equal(socket.status, 'stopped')
+      assert.equal(state.publishesDuringDisconnect, 0)
+    } finally {
+      await socket.close().catch(() => {})
+      await closeHttpServer(httpServer)
+    }
+  })
   test('resolves close when the transport does not disconnect before the shutdown deadline', async ({
     assert,
   }) => {

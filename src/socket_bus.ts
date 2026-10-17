@@ -161,6 +161,7 @@ export class SocketBus {
   #bus: Bus
   #presenceTimeout: number
   #pendingPresenceRequests = new Map<string, PendingPresenceRequest>()
+  #closing = false
 
   constructor(
     transport: SocketTransportConfig,
@@ -204,6 +205,8 @@ export class SocketBus {
   }
 
   publishChannel(channel: string, event: string, data: unknown, except?: string[]): void {
+    if (this.#closing) return
+
     const message: SocketBusMessage = {
       type: 'channel:event',
       origin: this.#origin,
@@ -217,6 +220,8 @@ export class SocketBus {
   }
 
   publishBroadcast(event: string, data: unknown): void {
+    if (this.#closing) return
+
     const message: BroadcastEventMessage = {
       type: 'broadcast:event',
       origin: this.#origin,
@@ -227,6 +232,8 @@ export class SocketBus {
   }
 
   fetchPresenceSockets(channel: string): Promise<PresenceSocket[]> {
+    if (this.#closing) return Promise.resolve([])
+
     const requestId = randomUUID()
 
     return new Promise((resolve) => {
@@ -257,7 +264,14 @@ export class SocketBus {
     })
   }
 
+  /**
+   * Publications sent once closing started are dropped, not queued: hooks
+   * or application code may still broadcast, and a write racing the
+   * transport disconnect would make it fail.
+   */
   async close(): Promise<void> {
+    this.#closing = true
+
     for (const [requestId, request] of this.#pendingPresenceRequests) {
       clearTimeout(request.timeout)
       request.resolve(request.sockets.map((socket) => socket.toSocket()))
@@ -270,6 +284,8 @@ export class SocketBus {
   async #respondToPresenceRequest(
     message: Extract<SocketBusMessage, { type: 'presence:sockets:request' }>
   ): Promise<void> {
+    if (this.#closing) return
+
     const response: PresenceSocketsResponseMessage = {
       type: 'presence:sockets:response',
       origin: this.#origin,
