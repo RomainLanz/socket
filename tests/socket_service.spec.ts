@@ -3398,6 +3398,44 @@ test.group('socket service', () => {
     }
   }).timeout(10_000)
 
+  test('releases a slow socket that ignores the close handshake', async ({ assert }) => {
+    const httpServer = createServer()
+    const socket = new SocketService()
+    let connectedSocketId: string | null = null
+    let disconnected = false
+
+    socket.on('connect', ({ socket: connectedSocket }) => {
+      connectedSocketId = connectedSocket.id
+    })
+    socket.on('disconnect', () => {
+      disconnected = true
+    })
+
+    await socket.boot(
+      httpServer,
+      { websocket: { maxBufferedAmount: 1024 } },
+      new ChannelRouter(),
+      makeLogger()
+    )
+    const port = await listen(httpServer)
+    const client = await connectRawWebSocket(port)
+
+    try {
+      await waitFor(() => connectedSocketId !== null)
+      const connectedSocket = socket.getSocket(connectedSocketId!)!
+      setBufferedAmount(connectedSocket.raw.connection, 1025)
+
+      connectedSocket.emit('direct', { ok: true })
+
+      await waitFor(() => disconnected, 1000)
+      assert.equal(socket.connectionsCount, 0)
+    } finally {
+      client.destroy()
+      await socket.close()
+      await closeHttpServer(httpServer)
+    }
+  })
+
   test('applies outbound backpressure to channel acknowledgements', async ({ assert }) => {
     class ChatChannel extends BaseChannel {
       static pattern = 'chat/:roomId'

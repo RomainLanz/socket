@@ -66,6 +66,7 @@ const DEFAULT_MAX_OUTBOUND_PAYLOAD = 1024 * 1024
 const DEFAULT_MAX_SUBSCRIPTIONS_PER_SOCKET = 100
 const DEFAULT_MAX_CHANNEL_NAME_LENGTH = 255
 const DEFAULT_SHUTDOWN_TIMEOUT = 5_000
+const FORCED_CLOSE_DELAY = 50
 const CLOSE_POLICY_VIOLATION = 1008
 const CLOSE_MESSAGE_TOO_BIG = 1009
 const CLOSE_OUTBOUND_BUFFER_LIMIT = 'Socket outbound buffer limit exceeded'
@@ -146,7 +147,7 @@ function sendSerializedFrameWithBackpressure(
   }
 
   if (connection.bufferedAmount + payloadSize > config.maxBufferedAmount) {
-    closeConnection(connection, CLOSE_POLICY_VIOLATION, CLOSE_OUTBOUND_BUFFER_LIMIT)
+    closeAndTerminate(connection, CLOSE_POLICY_VIOLATION, CLOSE_OUTBOUND_BUFFER_LIMIT)
     return false
   }
 
@@ -264,6 +265,18 @@ function closeConnection(connection: WebSocket, code: number, reason: string): v
   if (connection.readyState === WebSocket.OPEN) {
     connection.close(code, reason)
   }
+}
+
+/**
+ * Sends a close frame, then terminates a peer that does not complete the
+ * handshake quickly, instead of letting ws hold it for its 30s close timeout.
+ */
+function closeAndTerminate(connection: WebSocket, code: number, reason: string): void {
+  if (connection.readyState === WebSocket.CLOSED) return
+
+  connection.close(code, reason)
+  const terminateTimer = setTimeout(() => connection.terminate(), FORCED_CLOSE_DELAY)
+  connection.once('close', () => clearTimeout(terminateTimer))
 }
 
 interface SocketServiceRuntime<User> {
@@ -1239,12 +1252,7 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
     this.#stopHeartbeat()
     const sockets = [...this.#sockets.values()]
     for (const socket of sockets) {
-      const { connection } = socket.raw
-      if (connection.readyState === WebSocket.CLOSED) continue
-
-      connection.close(code, reason)
-      const terminateTimer = setTimeout(() => connection.terminate(), 50)
-      connection.once('close', () => clearTimeout(terminateTimer))
+      closeAndTerminate(socket.raw.connection, code, reason)
     }
 
     const finalizations = sockets.map((socket) => this.#finalizeSocket(socket))
