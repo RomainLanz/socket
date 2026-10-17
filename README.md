@@ -510,9 +510,11 @@ export default class RoomChannel extends BaseChannel<User, ServerEvents> {
 ```
 
 The member `id` groups multiple sockets or browser tabs for the same person. These sockets remain
-separate broadcast targets but produce one entry in the presence snapshot. `onMemberJoin` runs for
-the first locally observed socket. `onMemberLeave` runs after the last one leaves. `onJoin` and
-`onLeave` still run for every socket.
+separate broadcast targets but produce one entry in the presence snapshot. `onMemberJoin` runs when
+the member was absent from the presence snapshot taken as the socket joins, and `onMemberLeave` runs
+when the member is absent from the snapshot taken after a socket leaves. With a transport, that
+snapshot is the distributed one, so it covers sockets on other instances that answered in time and
+inherits its best-effort limits. `onJoin` and `onLeave` still run for every socket.
 
 Snapshots flatten `data` into `{ id, ...data, joinedAt }`. Use JSON-compatible values. The package
 checks snapshot serialization before running join hooks.
@@ -757,6 +759,14 @@ entries by default, removes duplicate messages, and drops the oldest entry when 
 `transport.retryQueue` to change these rules or disable retries. Setting `maxSize: null` creates an
 unbounded queue. A transport reconnect can deliver queued events after newer events.
 
+During a short outage, ioredis keeps publications in its offline buffer and sends them in order once
+it reconnects, so they do not reach `retryQueue`. That buffer has no size limit and only gives up
+after `maxRetriesPerRequest` reconnect attempts (20 by default).
+
+Redis Pub/Sub only delivers to instances subscribed at publish time. Events replayed after a Redis
+restart, from the retry queue or the ioredis buffer, are often lost: other instances may not have
+resubscribed yet when they are sent.
+
 Presence uses the transport to collect snapshots. `presenceTimeout`, which defaults to `100ms`, sets
 how long an instance waits for replies. A presence subscribe takes one snapshot before its join hooks
 and a fresh one after them, so its acknowledgement waits about twice `presenceTimeout`, plus the
@@ -829,6 +839,11 @@ server is bounded by `shutdownTimeout` separately. JavaScript handlers that igno
 
 Remove an instance from new traffic before a rolling restart when your platform allows it. Give the
 process enough termination time to run hooks and close the bus.
+
+With a Redis transport and the AdonisJS pino logger running in a worker transport, a SIGTERM can
+occasionally leave the process running because pino's thread-stream worker never completed its ready
+handshake. This is an upstream issue in pino and thread-stream, not in this package. A synchronous
+logger destination in production avoids it.
 
 There is no built-in total connection limit. Each connection consumes a file descriptor, memory,
 heartbeat state, message queues, and channel subscriptions. Set memory and file descriptor limits,
