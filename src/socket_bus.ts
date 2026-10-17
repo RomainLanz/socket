@@ -57,6 +57,8 @@ export interface SocketTransportConfig {
   channel?: string
   /**
    * How long to wait for other instances to answer a presence snapshot request.
+   * A presence subscribe waits for two snapshots, so keep twice this value
+   * under the client's subscribe timeout (5000 ms by default).
    */
   presenceTimeout?: Duration
   /**

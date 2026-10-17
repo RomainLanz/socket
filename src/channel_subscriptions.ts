@@ -192,6 +192,12 @@ export class ChannelSubscriptions<User = unknown> {
         }
         attempt.memberJoined.resolve(true)
         await result.instance.onJoin?.(socket, ...result.paramValues)
+
+        // Members may have joined or left while the hooks ran. Each local
+        // member's data was validated by its own join and remote members
+        // arrive as JSON, so the fresh snapshot needs no serialization check.
+        presenceSnapshot = await this.presenceManager!.snapshot(channelName)
+        presenceData = presenceSnapshot
       } else {
         try {
           JSON.stringify(presenceData)

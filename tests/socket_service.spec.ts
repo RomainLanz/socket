@@ -3565,6 +3565,173 @@ test.group('socket service', () => {
     }
   })
 
+  test('announces the presence snapshot taken after a slow onJoin', async ({ assert }) => {
+    const joinStarted = Promise.withResolvers<void>()
+    const releaseJoin = Promise.withResolvers<void>()
+    let blockJoin = false
+
+    class RoomChannel extends BaseChannel {
+      static pattern = 'presence/:roomId'
+      static options = { presence: true }
+
+      getPresenceInfo(socket: { id: string }) {
+        return { id: socket.id, data: {} }
+      }
+
+      async onJoin() {
+        if (!blockJoin) return
+        joinStarted.resolve()
+        await releaseJoin.promise
+      }
+    }
+
+    const httpServer = createServer()
+    const socket = new SocketService()
+    const router = new ChannelRouter()
+    const connectedIds: string[] = []
+    router.register(RoomChannel as any)
+    socket.setPresenceManager(new PresenceManager())
+    socket.on('connect', ({ socket: connected }) => {
+      connectedIds.push(connected.id)
+    })
+
+    await socket.boot(httpServer, {}, router, makeLogger())
+    const port = await listen(httpServer)
+    // Connect one at a time so connectedIds follows the client order.
+    const observer = await connectClient(port)
+    await waitFor(() => connectedIds.length === 1)
+    const leaver = await connectClient(port)
+    await waitFor(() => connectedIds.length === 2)
+    const newcomer = await connectClient(port)
+    const updates: string[][] = []
+    observer.on('message', (raw) => {
+      const frame = JSON.parse(raw.toString())
+      if (frame.type === 'event' && frame.event === 'presence:update') {
+        updates.push(frame.data.users.map((user: { id: string }) => user.id))
+      }
+    })
+
+    try {
+      await waitFor(() => connectedIds.length === 3)
+      const [observerId, leaverId, newcomerId] = connectedIds
+      await sendAndWaitForAck(observer, { type: 'subscribe', channel: 'presence/a' })
+      await sendAndWaitForAck(leaver, { type: 'subscribe', channel: 'presence/a' })
+
+      blockJoin = true
+      const ack = waitForFrame(newcomer, (frame) => frame.id === 'join', 2000)
+      newcomer.send(JSON.stringify({ id: 'join', type: 'subscribe', channel: 'presence/a' }))
+      await joinStarted.promise
+
+      leaver.close()
+      await waitFor(() => !socket.getSocket(leaverId))
+      releaseJoin.resolve()
+      const joined = (await ack) as { data: { presenceData: { users: { id: string }[] } } }
+      await sleep(50)
+
+      // Members joining in the same millisecond are ordered by random socket id.
+      const expected = [observerId, newcomerId].sort()
+      assert.deepEqual(joined.data.presenceData.users.map((user) => user.id).sort(), expected)
+      assert.deepEqual(updates.at(-1)?.sort(), expected)
+    } finally {
+      releaseJoin.resolve()
+      observer.terminate()
+      leaver.terminate()
+      newcomer.terminate()
+      await socket.close()
+      await closeHttpServer(httpServer)
+    }
+  })
+
+  test('announces a remote leave that happened during a slow onJoin', async ({ assert }) => {
+    const joinStarted = Promise.withResolvers<void>()
+    const releaseJoin = Promise.withResolvers<void>()
+    let blockJoin = false
+
+    class RoomChannel extends BaseChannel {
+      static pattern = 'presence/:roomId'
+      static options = { presence: true }
+
+      getPresenceInfo(socket: { id: string }) {
+        return { id: socket.id, data: {} }
+      }
+
+      async onJoin() {
+        if (!blockJoin) return
+        joinStarted.resolve()
+        await releaseJoin.promise
+      }
+    }
+
+    const transport = { ...makeTransportConfig(), presenceTimeout: 20 }
+    const localHttpServer = createServer()
+    const remoteHttpServer = createServer()
+    const local = new SocketService()
+    const remote = new SocketService()
+    const localRouter = new ChannelRouter()
+    const remoteRouter = new ChannelRouter()
+    const connectedIds: string[] = []
+    localRouter.register(RoomChannel as any)
+    remoteRouter.register(RoomChannel as any)
+    local.setPresenceManager(new PresenceManager())
+    remote.setPresenceManager(new PresenceManager())
+    local.on('connect', ({ socket: connected }) => {
+      connectedIds.push(connected.id)
+    })
+    remote.on('connect', ({ socket: connected }) => {
+      connectedIds.push(connected.id)
+    })
+
+    await local.boot(localHttpServer, { transport }, localRouter, makeLogger())
+    await remote.boot(remoteHttpServer, { transport }, remoteRouter, makeLogger())
+    const localPort = await listen(localHttpServer)
+    const remotePort = await listen(remoteHttpServer)
+    const observer = await connectClient(localPort)
+    await waitFor(() => connectedIds.length === 1)
+    const leaver = await connectClient(remotePort)
+    await waitFor(() => connectedIds.length === 2)
+    const newcomer = await connectClient(localPort)
+    const updates: string[][] = []
+    observer.on('message', (raw) => {
+      const frame = JSON.parse(raw.toString())
+      if (frame.type === 'event' && frame.event === 'presence:update') {
+        updates.push(frame.data.users.map((user: { id: string }) => user.id))
+      }
+    })
+
+    try {
+      await waitFor(() => connectedIds.length === 3)
+      const [observerId, leaverId, newcomerId] = connectedIds
+      await sendAndWaitForAck(observer, { type: 'subscribe', channel: 'presence/a' })
+      await sendAndWaitForAck(leaver, { type: 'subscribe', channel: 'presence/a' })
+      await waitFor(() => updates.at(-1)?.includes(leaverId) === true)
+
+      blockJoin = true
+      const ack = waitForFrame(newcomer, (frame) => frame.id === 'join', 2000)
+      newcomer.send(JSON.stringify({ id: 'join', type: 'subscribe', channel: 'presence/a' }))
+      await joinStarted.promise
+
+      leaver.close()
+      await waitFor(() => updates.at(-1)?.includes(leaverId) === false)
+      releaseJoin.resolve()
+      const joined = (await ack) as { data: { presenceData: { users: { id: string }[] } } }
+      await sleep(50)
+
+      // Members joining in the same millisecond are ordered by random socket id.
+      const expected = [observerId, newcomerId].sort()
+      assert.deepEqual(joined.data.presenceData.users.map((user) => user.id).sort(), expected)
+      assert.deepEqual(updates.at(-1)?.sort(), expected)
+    } finally {
+      releaseJoin.resolve()
+      observer.terminate()
+      leaver.terminate()
+      newcomer.terminate()
+      await local.close()
+      await remote.close()
+      await closeHttpServer(localHttpServer)
+      await closeHttpServer(remoteHttpServer)
+    }
+  }).timeout(10_000)
+
   test('coordinates concurrent presence joins without serializing distributed snapshots', async ({
     assert,
   }) => {

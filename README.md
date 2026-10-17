@@ -758,7 +758,10 @@ entries by default, removes duplicate messages, and drops the oldest entry when 
 unbounded queue. A transport reconnect can deliver queued events after newer events.
 
 Presence uses the transport to collect snapshots. `presenceTimeout`, which defaults to `100ms`, sets
-how long an instance waits for replies.
+how long an instance waits for replies. A presence subscribe takes one snapshot before its join hooks
+and a fresh one after them, so its acknowledgement waits about twice `presenceTimeout`, plus the
+join hooks. Keep that under the client's subscribe timeout, `5000` ms by default: from about `2.5s`,
+every presence subscribe times out on the client.
 
 The transport does not make events durable. The package does not persist messages, acknowledge
 recipients, or recover events after a process restart. Persist application state separately when a
