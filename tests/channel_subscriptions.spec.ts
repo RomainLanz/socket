@@ -138,7 +138,7 @@ test.group('channel subscriptions', () => {
     await subscriptions.subscribe(socket, 'chat/general')
     assert.deepEqual(subscriptions.getSocketIds('chat/general'), [socket.id])
 
-    subscriptions.deleteSocket(socket.id)
+    await subscriptions.release(socket)
     assert.deepEqual(subscriptions.getSocketIds('chat/general'), [])
   })
 
@@ -376,7 +376,7 @@ test.group('channel subscriptions', () => {
     )
   })
 
-  test('leaveAll removes every durable subscription for the socket', async ({ assert }) => {
+  test('release removes every subscription before running leave hooks', async ({ assert }) => {
     class ChatChannel extends BaseChannel {
       static pattern = 'chat/:roomId'
       static leftChannels: string[] = []
@@ -395,12 +395,13 @@ test.group('channel subscriptions', () => {
     await subscriptions.subscribe(socket, 'chat/general')
     await subscriptions.subscribe(socket, 'chat/random')
 
-    await subscriptions.leaveAll(socket)
+    const leaving = subscriptions.release(socket)
 
-    assert.sameMembers(ChatChannel.leftChannels, ['general', 'random'])
     assert.equal(subscriptions.subscriptionCountFor(socket.id), 0)
     assert.deepEqual(subscriptions.getSocketIds('chat/general'), [])
     assert.deepEqual(subscriptions.getSocketIds('chat/random'), [])
+    await leaving
+    assert.sameMembers(ChatChannel.leftChannels, ['general', 'random'])
   })
 
   test('rollback durable membership and presence when join fails', async ({ assert }) => {
@@ -559,6 +560,11 @@ test.group('channel subscriptions', () => {
     assert.equal(subscriptions.subscriptionCountFor(secondSocket.id), 0)
     assert.isFalse(presence.hasLocal('presence-targets/general', secondSocket.id))
     assert.equal(await presence.count('presence-targets/general'), 1)
+    // The failure is answered after the leave hooks, which announced the removal.
+    assert.deepInclude(socketService.broadcasts.at(-1), {
+      event: 'presence:update',
+      recipients: [firstSocket.id],
+    })
     assert.notInclude(
       socketService.broadcasts.flatMap((broadcast: Record<string, unknown>) => {
         return broadcast.recipients as string[]

@@ -39,6 +39,7 @@ import {
 } from './socket_upgrader.js'
 import { parseDuration, type Duration } from './duration.js'
 import { SocketResponseError } from './base_channel.js'
+import { PendingWork } from './pending_work.js'
 import {
   broadcastChannel,
   channelMessageChannel,
@@ -275,6 +276,8 @@ interface SocketServiceRuntime<User> {
   acceptingUpgrades: boolean
   serverClose?: Promise<unknown | null>
   webSocketsClose?: Promise<void>
+  /** Set by closeWebSockets(); close() waits for hooks no later than this. */
+  hooksDeadline?: number
 }
 
 interface SocketServiceBootOperation<User> {
@@ -325,6 +328,8 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
   #messageQueue = new MessageQueue()
   #messageRates = new Map<string, SocketMessageRate>()
   #socketFinalizations = new Map<string, Promise<void>>()
+  // Handlers still running for closed sockets, counted rather than kept per socket
+  #runningHandlers = new PendingWork()
   #outboundMessageConfig = resolveOutboundMessageConfig(undefined)
   #shutdownTimeout = DEFAULT_SHUTDOWN_TIMEOUT
   #logger: Logger | null = null
@@ -602,6 +607,9 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
       const enqueued = this.#messageQueue.enqueue(
         socket.id,
         async () => {
+          // Messages queued before the socket closed are not handled.
+          if (this.#sockets.get(socket.id) !== socket) return
+
           await this.#handleMessage(socket, message).catch((error) => {
             try {
               this.#logger?.warn('unexpected socket message failure: %s', error)
@@ -637,6 +645,11 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
     })
   }
 
+  /**
+   * Releases a closed socket at once: it leaves the socket map, its
+   * subscriptions and presence, then disconnect is emitted. Its leave hooks
+   * and running handlers are not awaited for that; close() waits for them.
+   */
   #finalizeSocket(socket: AuthenticatedSocket<User>): Promise<void> {
     const pending = this.#socketFinalizations.get(socket.id)
     if (pending) {
@@ -653,10 +666,9 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
         async () => {
           this.#clearHeartbeatTimeout(socket.id)
           this.#messageRates.delete(socket.id)
-          await this.#messageQueue.drain(socket.id)
+          this.#runningHandlers.track(this.#messageQueue.drain(socket.id))
           this.#messageQueue.delete(socket.id)
-          await channelSubscriptions?.leaveAll(socket)
-          channelSubscriptions?.deleteSocket(socket.id)
+          void channelSubscriptions?.release(socket)
           this.#sockets.delete(socket.id)
           this.#emitLifecycleEvent('disconnect', { socket, reason: 'close' })
         },
@@ -1130,6 +1142,7 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
     this.#messageQueue.clear()
     this.#messageRates.clear()
     this.#socketFinalizations.clear()
+    this.#runningHandlers = new PendingWork()
     channelSubscriptions?.clear()
   }
 
@@ -1143,6 +1156,7 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
     runtime.httpServer.off('upgrade', runtime.upgradeHandler)
 
     const deadline = Date.now() + this.#shutdownTimeout
+    runtime.hooksDeadline = deadline
     const serverClose = this.#startServerClose(runtime)
     const close = (async () => {
       const errors = await this.#closeSockets(deadline, code, reason)
@@ -1233,9 +1247,12 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
       connection.once('close', () => clearTimeout(terminateTimer))
     }
 
-    const finalizations = sockets.map((socket) => {
-      return Promise.resolve().then(() => this.#finalizeSocket(socket))
-    })
+    const finalizations = sockets.map((socket) => this.#finalizeSocket(socket))
+    // Leave hooks and handlers, including those of sockets that closed earlier.
+    for (const pending of [this.#runningHandlers.settled(), this.#channelSubscriptions?.drain()]) {
+      if (pending) finalizations.push(pending)
+    }
+    if (finalizations.length === 0) return []
     const results = await settleBeforeDeadline(Promise.allSettled(finalizations), deadline)
     if (results === null) {
       this.#warn(
@@ -1317,7 +1334,14 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
     }
 
     const serverClose = this.#startServerClose(runtime)
-    const errors = await this.#closeSockets(deadline, SERVICE_RESTART_CODE, SERVICE_RESTART_REASON)
+    // Hooks share one shutdownTimeout with a preceding closeWebSockets(), so
+    // the provider's shutdown sequence does not wait for them twice.
+    const hooksDeadline = Math.min(deadline, runtime?.hooksDeadline ?? deadline)
+    const errors = await this.#closeSockets(
+      hooksDeadline,
+      SERVICE_RESTART_CODE,
+      SERVICE_RESTART_REASON
+    )
 
     this.#cleanup(channelSubscriptions)
     this.#presenceManager?.setSocketFetcher(null)

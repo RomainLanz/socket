@@ -794,8 +794,21 @@ in-flight requests. Provider shutdown then disconnects the bus. A direct `Socket
 uses `1012 Service Restart`. Clients reconnect and restore desired channel subscriptions by default.
 The service does not wait for pending client acknowledgements.
 
-After `shutdownTimeout`, the service releases its internal socket and subscription state. JavaScript
-handlers that ignore cancellation can continue running.
+When a socket closes, the service releases it at once: the socket leaves the connection count, its
+subscriptions, and presence, and `disconnect` is emitted. `onMemberLeave` and `onLeave` run
+afterwards, so `disconnect` fires before they finish, and remaining members get `presence:update`
+as soon as a fresh snapshot is taken. A handler or hook that never settles only keeps its own
+promise pending. Messages still queued for the socket are dropped, and a subscribe that completes
+after the socket closed is not stored: it runs its own `onLeave`, and `onMemberLeave` when that
+socket was the member's last one on the instance. Of several sockets of one member that close
+together, only the last one removed runs `onMemberLeave`. A socket's `onMemberLeave` waits for its
+`onMemberJoin` and `onLeave` waits for its `onJoin`, so the hooks stay paired when a socket closes
+during a slow join.
+
+During shutdown, the service waits for those hooks and handlers until `shutdownTimeout`, then
+releases the remaining service state. Provider shutdown closes clients before the HTTP drain and calls
+`close()` afterwards; both share that one deadline for hooks. Closing the transport and the WebSocket
+server is bounded by `shutdownTimeout` separately. JavaScript handlers that ignore cancellation can continue running.
 
 Remove an instance from new traffic before a rolling restart when your platform allows it. Give the
 process enough termination time to run hooks and close the bus.

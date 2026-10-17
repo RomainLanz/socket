@@ -6,7 +6,8 @@ import {
   type StoredChannelSubscription,
 } from './channel_subscription_storage.js'
 import type { ChannelRouter } from './channel_router.js'
-import type { PresenceData, PresenceManager } from './presence_manager.js'
+import type { PresenceData, PresenceManager, PresenceUser } from './presence_manager.js'
+import { PendingWork } from './pending_work.js'
 import type { SocketService } from './socket_service.js'
 import type { AuthenticatedSocket, ChannelAck, ChannelMessage } from './types.js'
 
@@ -30,9 +31,32 @@ export interface ChannelSubscribeResult {
   created: boolean
 }
 
+const SOCKET_CLOSED_ERROR = 'Socket closed'
+
 export interface ChannelSubscriptionLimits {
   maxSubscriptionsPerSocket: number
   maxChannelNameLength: number
+}
+
+/**
+ * One subscribe of a socket on a channel, from its join hooks until its
+ * leave hooks ran. Every teardown goes through #detach, which releases the
+ * attempt at once and runs its leave hooks exactly once:
+ *
+ *   joining ──join hooks done──▶ active
+ *      │                           │
+ *      └────────── #detach ────────┴──▶ released ──▶ leave hooks
+ */
+interface SubscriptionAttempt<User> {
+  socket: AuthenticatedSocket<User>
+  subscription: StoredChannelSubscription
+  state: 'joining' | 'active' | 'released'
+  /** Settles once onMemberJoin ran or was not needed; false if it failed. */
+  memberJoined: PromiseWithResolvers<boolean>
+  /** Settles once onJoin ran; false if the join failed. */
+  joined: PromiseWithResolvers<boolean>
+  /** The leave hooks, set when the attempt is released. */
+  cleanup?: Promise<void>
 }
 
 /**
@@ -40,7 +64,10 @@ export interface ChannelSubscriptionLimits {
  */
 export class ChannelSubscriptions<User = unknown> {
   #storage = new ChannelSubscriptionStorage()
-  #channelOperations = new Map<string, Promise<void>>()
+  // socket id -> channel name -> attempt not released yet
+  #attempts = new Map<string, Map<string, SubscriptionAttempt<User>>>()
+  #leaveHooks = new PendingWork()
+  #closedSockets = new WeakSet<AuthenticatedSocket<User>>()
 
   static #serializePresenceData(presenceData: PresenceData): Record<string, unknown> {
     return {
@@ -110,17 +137,6 @@ export class ChannelSubscriptions<User = unknown> {
       }
     }
 
-    if (this.#usesPresence(result.instance)) {
-      return this.#withChannelOperation(`${socket.id}\0${channelName}`, async () => {
-        const concurrentSubscription = await this.#refreshExistingSubscription(socket, channelName)
-        if (concurrentSubscription) {
-          return concurrentSubscription
-        }
-
-        return this.#completeSubscription(socket, channelName, result)
-      })
-    }
-
     return this.#completeSubscription(socket, channelName, result)
   }
 
@@ -129,6 +145,19 @@ export class ChannelSubscriptions<User = unknown> {
     channelName: string,
     result: AuthorizedChannel<User>
   ): Promise<ChannelSubscribeResult> {
+    if (this.#closedSockets.has(socket)) {
+      return { ack: { ok: false, error: SOCKET_CLOSED_ERROR }, created: false }
+    }
+
+    const attempt: SubscriptionAttempt<User> = {
+      socket,
+      subscription: { channelName, instance: result.instance, paramValues: result.paramValues },
+      state: 'joining',
+      memberJoined: Promise.withResolvers(),
+      joined: Promise.withResolvers(),
+    }
+    const attempts = this.#attempts.get(socket.id) ?? new Map()
+    this.#attempts.set(socket.id, attempts.set(channelName, attempt))
     result.instance.$setContext(
       this.socketService,
       channelName,
@@ -138,7 +167,6 @@ export class ChannelSubscriptions<User = unknown> {
 
     let presenceData: Record<string, unknown> | PresenceData | null = result.presenceData
     let presenceSnapshot: PresenceData | null = null
-    let presenceJoined = false
     let serializationError: unknown
 
     try {
@@ -146,7 +174,6 @@ export class ChannelSubscriptions<User = unknown> {
         const presenceInfo = result.instance.$getPresenceInfo(socket)
         const joinedUser = this.presenceManager!.join(channelName, socket.raw, presenceInfo)
         const { joinedAt: _joinedAt, ...member } = joinedUser
-        presenceJoined = true
 
         presenceSnapshot = await this.presenceManager!.snapshot(channelName)
         presenceData = presenceSnapshot
@@ -163,6 +190,7 @@ export class ChannelSubscriptions<User = unknown> {
         if (!wasPresent) {
           await result.instance.onMemberJoin?.(socket, member, ...result.paramValues)
         }
+        attempt.memberJoined.resolve(true)
         await result.instance.onJoin?.(socket, ...result.paramValues)
       } else {
         try {
@@ -174,12 +202,15 @@ export class ChannelSubscriptions<User = unknown> {
 
         await result.instance.onJoin?.(socket, ...result.paramValues)
       }
+      attempt.joined.resolve(true)
 
-      this.#storage.set(socket.id, channelName, {
-        channelName,
-        instance: result.instance,
-        paramValues: result.paramValues,
-      })
+      // The socket closed while the join hooks ran; #detach runs its leave.
+      if (attempt.state === 'released') {
+        return { ack: { ok: false, error: SOCKET_CLOSED_ERROR }, created: false }
+      }
+
+      attempt.state = 'active'
+      this.#storage.set(socket.id, channelName, attempt.subscription)
 
       if (presenceSnapshot) {
         this.socketService
@@ -188,18 +219,9 @@ export class ChannelSubscriptions<User = unknown> {
           .emit('presence:update', ChannelSubscriptions.#serializePresenceData(presenceSnapshot))
       }
     } catch (error) {
-      if (presenceJoined) {
-        this.presenceManager!.leave(channelName, socket.raw)
-
-        const rollbackData = await this.presenceManager!.snapshot(channelName).catch(() => null)
-        if (rollbackData) {
-          this.socketService
-            .to(channelName)
-            .emit('presence:update', ChannelSubscriptions.#serializePresenceData(rollbackData))
-        }
-      }
-
-      this.#storage.delete(socket.id, channelName)
+      attempt.memberJoined.resolve(false)
+      attempt.joined.resolve(false)
+      await this.#detach(attempt)
 
       if (serializationError) {
         this.#warn(
@@ -230,59 +252,107 @@ export class ChannelSubscriptions<User = unknown> {
   }
 
   async leave(socket: AuthenticatedSocket<User>, channelName: string): Promise<boolean> {
-    const subscription = this.#storage.get(socket.id, channelName)
-    if (!subscription) {
+    const attempt = this.#attempts.get(socket.id)?.get(channelName)
+    if (attempt?.state !== 'active') {
       return false
     }
 
-    this.#storage.delete(socket.id, channelName)
-
-    if (this.#usesPresence(subscription.instance)) {
-      await this.#withChannelOperation(`${socket.id}\0${channelName}`, () =>
-        this.#cleanupAfterLeave(socket, channelName, subscription)
-      )
-    } else {
-      await this.#cleanupAfterLeave(socket, channelName, subscription)
-    }
-
+    await this.#detach(attempt)
     return true
   }
 
+  /**
+   * Releases a closed socket. Its subscriptions and presence are gone when
+   * this returns, so callers can emit disconnect right away. Leave hooks run
+   * afterwards, also for joins still completing; the returned promise
+   * settles once they finished.
+   */
+  release(socket: AuthenticatedSocket<User>): Promise<void> {
+    this.#closedSockets.add(socket)
+    const attempts = [...(this.#attempts.get(socket.id)?.values() ?? [])]
+    return Promise.all(attempts.map((attempt) => this.#detach(attempt))).then(() => {})
+  }
+
+  /**
+   * Settles once the leave hooks started so far finished, or returns null
+   * when none is running. Used by shutdown.
+   */
+  drain(): Promise<void> | null {
+    return this.#leaveHooks.settled()
+  }
+
+  /**
+   * Releases an attempt at once: it leaves storage and presence, and its
+   * leave hooks start on the next turn, after the caller's own work such as
+   * disconnect listeners. Returns those hooks.
+   */
+  #detach(attempt: SubscriptionAttempt<User>): Promise<void> {
+    if (attempt.cleanup) return attempt.cleanup
+
+    const { socket, subscription } = attempt
+    const duringJoin = attempt.state === 'joining'
+    attempt.state = 'released'
+    this.#storage.delete(socket.id, subscription.channelName)
+    // Decided now, so of several sockets of one member leaving together
+    // only the last one removed runs onMemberLeave.
+    const lastLocalUser = this.presenceManager?.leave(subscription.channelName, socket.raw)
+
+    const attempts = this.#attempts.get(socket.id)
+    if (attempts?.get(subscription.channelName) === attempt) {
+      attempts.delete(subscription.channelName)
+      if (attempts.size === 0) this.#attempts.delete(socket.id)
+    }
+
+    attempt.cleanup = new Promise<void>((resolve) => setImmediate(resolve)).then(() =>
+      this.#cleanupAfterLeave(attempt, lastLocalUser, duringJoin)
+    )
+    this.#leaveHooks.track(attempt.cleanup)
+    return attempt.cleanup
+  }
+
+  /**
+   * Runs the leave hooks of a released attempt, each paired with its join
+   * hook: onMemberLeave waits for onMemberJoin, which may finish long before
+   * a slow onJoin, and onLeave runs once onJoin succeeded. The presence:update
+   * waits for neither. `lastLocalUser` is set when the removal took the
+   * member's last local socket.
+   */
   async #cleanupAfterLeave(
-    socket: AuthenticatedSocket<User>,
-    channelName: string,
-    subscription: StoredChannelSubscription
+    attempt: SubscriptionAttempt<User>,
+    lastLocalUser: PresenceUser | undefined,
+    duringJoin: boolean
   ): Promise<void> {
+    const { socket, subscription } = attempt
+    const { channelName } = subscription
+
     if (this.#usesPresence(subscription.instance)) {
-      const presenceUser = this.presenceManager!.getLocalUser(channelName, socket.id)
-      this.presenceManager!.leave(channelName, socket.raw)
-
       try {
-        const presenceData = await this.presenceManager!.snapshot(channelName)
-
+        let presenceData = await this.presenceManager!.snapshot(channelName)
         this.socketService
           .to(channelName)
           .emit('presence:update', ChannelSubscriptions.#serializePresenceData(presenceData))
 
-        if (presenceUser && !presenceData.users.some((user) => user.id === presenceUser.id)) {
-          const { joinedAt: _joinedAt, ...member } = presenceUser
-          await subscription.instance.onMemberLeave?.(socket, member, ...subscription.paramValues)
+        if (lastLocalUser && (await attempt.memberJoined.promise)) {
+          // The member may have rejoined while its onMemberJoin was running.
+          // Skipping the leave then is the lesser evil: that member gets two
+          // onMemberJoin and one onMemberLeave, instead of a leave while present.
+          if (duringJoin) presenceData = await this.presenceManager!.snapshot(channelName)
+          if (!presenceData.users.some((user) => user.id === lastLocalUser.id)) {
+            const { joinedAt: _joinedAt, ...member } = lastLocalUser
+            await subscription.instance.onMemberLeave?.(socket, member, ...subscription.paramValues)
+          }
         }
       } catch (error) {
         this.#warn(`failed to update presence while leaving channel "${channelName}": %s`, error)
       }
     }
 
+    if (!(await attempt.joined.promise)) return
+
     try {
       await subscription.instance.onLeave?.(socket, ...subscription.paramValues)
     } catch (error) {
       this.#warn(`failed to leave channel "${channelName}": %s`, error)
-    }
-  }
-
-  async leaveAll(socket: AuthenticatedSocket<User>): Promise<void> {
-    for (const channelName of this.#storage.channelNamesFor(socket.id)) {
-      await this.leave(socket, channelName)
     }
   }
 
@@ -335,13 +405,10 @@ export class ChannelSubscriptions<User = unknown> {
     return { ok: true }
   }
 
-  deleteSocket(socketId: string): void {
-    this.#storage.deleteSocket(socketId)
-  }
-
   clear(): void {
     this.#storage.clear()
-    this.#channelOperations.clear()
+    this.#attempts.clear()
+    this.#leaveHooks = new PendingWork()
   }
 
   getSocketIds(channelName: string): string[] {
@@ -361,26 +428,6 @@ export class ChannelSubscriptions<User = unknown> {
       this.logger.warn(message, error)
     } catch {
       // Logging must never change the socket protocol outcome.
-    }
-  }
-
-  async #withChannelOperation<Result>(
-    operationKey: string,
-    operation: () => Promise<Result>
-  ): Promise<Result> {
-    const previous = this.#channelOperations.get(operationKey) ?? Promise.resolve()
-    const release = Promise.withResolvers<void>()
-    const queued = previous.then(() => release.promise)
-    this.#channelOperations.set(operationKey, queued)
-
-    await previous
-    try {
-      return await operation()
-    } finally {
-      release.resolve()
-      if (this.#channelOperations.get(operationKey) === queued) {
-        this.#channelOperations.delete(operationKey)
-      }
     }
   }
 

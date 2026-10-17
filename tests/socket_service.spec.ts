@@ -1,6 +1,8 @@
 import { createServer, type Server as HttpServer } from 'node:http'
 import { Socket as NetSocket } from 'node:net'
 import { randomBytes, randomUUID } from 'node:crypto'
+import { setFlagsFromString } from 'node:v8'
+import { runInNewContext } from 'node:vm'
 import { test } from '@japa/runner'
 import { memory } from '@boringnode/bus/transports/memory'
 import { WebSocket } from 'ws'
@@ -53,6 +55,16 @@ async function waitFor(assertion: () => boolean, timeout = 5000): Promise<void> 
   }
 
   throw new Error('Timed out waiting for assertion')
+}
+
+/** Runs full garbage collections so tests can observe what stays reachable. */
+async function collectGarbage(): Promise<void> {
+  setFlagsFromString('--expose_gc')
+  const gc = runInNewContext('gc') as () => void
+  for (let i = 0; i < 5; i++) {
+    gc()
+    await new Promise<void>((resolve) => setImmediate(resolve))
+  }
 }
 
 async function sleep(ms: number): Promise<void> {
@@ -296,6 +308,43 @@ function makeTransportConfig(channel = `socket:test:${randomUUID()}`): SocketTra
     driver: memory(),
     channel,
   }
+}
+/**
+ * Transport double that fails its disconnect, like ioredis, when a
+ * publication is written while the connection quits.
+ */
+function makeQuittingTransport() {
+  const state = { publishesDuringDisconnect: 0, disconnectStarted: Promise.withResolvers<void>() }
+  let disconnecting = false
+  let failDisconnect: ((error: Error) => void) | undefined
+
+  const driver = () => {
+    const transport = {
+      setId() {
+        return transport
+      },
+      onReconnect() {},
+      async publish() {
+        if (!disconnecting) return
+        state.publishesDuringDisconnect += 1
+        failDisconnect?.(new Error('Connection is closed.'))
+        throw new Error('write EPIPE')
+      },
+      async subscribe() {},
+      async unsubscribe() {},
+      async disconnect() {
+        disconnecting = true
+        state.disconnectStarted.resolve()
+        await new Promise<void>((resolve, reject) => {
+          failDisconnect = reject
+          setTimeout(resolve, 300)
+        })
+      },
+    }
+    return transport
+  }
+
+  return { state, driver: driver as any }
 }
 
 test.group('socket service', () => {
@@ -828,6 +877,1043 @@ test.group('socket service', () => {
     }
   })
 
+  test('releases a disconnected socket whose message handler never settles', async ({ assert }) => {
+    const handlerStarted = Promise.withResolvers<void>()
+
+    class HangingPresenceChannel extends BaseChannel {
+      static pattern = 'hanging-presence/:roomId'
+      static options = { presence: true }
+
+      getPresenceInfo() {
+        return { id: 'user-1', data: {} }
+      }
+
+      @onMessage('hang')
+      async hang() {
+        handlerStarted.resolve()
+        await new Promise(() => {})
+      }
+    }
+
+    const httpServer = createServer()
+    const socket = new SocketService()
+    const presence = new PresenceManager()
+    const router = new ChannelRouter()
+    const disconnected: string[] = []
+    router.register(HangingPresenceChannel as any)
+    socket.setPresenceManager(presence)
+    socket.on('disconnect', ({ socket: disconnectedSocket }) => {
+      disconnected.push(disconnectedSocket.id)
+    })
+
+    // Bounds the close() in finally, which waits for the hung handler.
+    await socket.boot(httpServer, { websocket: { shutdownTimeout: 100 } }, router, makeLogger())
+    const port = await listen(httpServer)
+    const client = await connectClient(port)
+
+    try {
+      await sendAndWaitForAck(client, { type: 'subscribe', channel: 'hanging-presence/general' })
+      client.send(
+        JSON.stringify({ type: 'message', channel: 'hanging-presence/general', event: 'hang' })
+      )
+      await handlerStarted.promise
+      client.terminate()
+
+      await waitFor(() => disconnected.length === 1, 1000)
+
+      assert.equal(socket.connectionsCount, 0)
+      assert.equal(socket.health().connections, 0)
+      assert.equal(socket.health().channels, 0)
+      assert.equal(await presence.count('hanging-presence/general'), 0)
+    } finally {
+      client.terminate()
+      await socket.close()
+      await closeHttpServer(httpServer)
+    }
+  })
+
+  test('retains no closed socket whose message handler never settles', async ({ assert }) => {
+    class HangingChannel extends BaseChannel {
+      static pattern = 'chat/:roomId'
+
+      @onMessage('hang')
+      async hang() {
+        await new Promise(() => {})
+      }
+    }
+
+    const httpServer = createServer()
+    const socket = new SocketService()
+    const router = new ChannelRouter()
+    const closedSockets: WeakRef<object>[] = []
+    let disconnects = 0
+    router.register(HangingChannel as any)
+    socket.on('connect', ({ socket: connected }) => {
+      closedSockets.push(new WeakRef(connected))
+    })
+    socket.on('disconnect', () => {
+      disconnects++
+    })
+    await socket.boot(httpServer, { websocket: { shutdownTimeout: 20 } }, router, makeLogger())
+    const port = await listen(httpServer)
+
+    try {
+      for (let i = 0; i < 10; i++) {
+        const client = await connectClient(port)
+        await sendAndWaitForAck(client, { type: 'subscribe', channel: 'chat/a' })
+        client.send(JSON.stringify({ type: 'message', channel: 'chat/a', event: 'hang' }))
+        await sleep(5)
+        client.terminate()
+      }
+      await waitFor(() => disconnects === 10)
+      await collectGarbage()
+
+      assert.equal(closedSockets.filter((ref) => ref.deref()).length, 0)
+    } finally {
+      await socket.close()
+      await closeHttpServer(httpServer)
+    }
+  })
+
+  test('runs no queued work for a closed socket', async ({ assert }) => {
+    const events: string[] = []
+
+    class ChatChannel extends BaseChannel {
+      static pattern = 'chat/:roomId'
+
+      async onJoin(_socket: unknown, roomId: string) {
+        events.push(`join:chat/${roomId}`)
+      }
+
+      async onLeave(_socket: unknown, roomId: string) {
+        events.push(`leave:chat/${roomId}`)
+      }
+
+      @onMessage('sleep')
+      async sleep() {
+        await sleep(300)
+      }
+    }
+
+    class RoomChannel extends BaseChannel {
+      static pattern = 'presence/:roomId'
+      static options = { presence: true }
+
+      getPresenceInfo(socket: { id: string }) {
+        return { id: socket.id, data: {} }
+      }
+
+      async onMemberJoin() {
+        events.push('memberJoin')
+      }
+
+      async onJoin(_socket: unknown, roomId: string) {
+        events.push(`join:presence/${roomId}`)
+      }
+    }
+
+    const httpServer = createServer()
+    const socket = new SocketService()
+    const router = new ChannelRouter()
+    router.register(ChatChannel as any)
+    router.register(RoomChannel as any)
+    socket.setPresenceManager(new PresenceManager())
+    socket.on('subscribe', ({ channel }) => {
+      events.push(`subscribe:${channel}`)
+    })
+    socket.on('disconnect', () => {
+      events.push('disconnect')
+    })
+
+    await socket.boot(httpServer, {}, router, makeLogger())
+    const port = await listen(httpServer)
+    const client = await connectClient(port)
+
+    try {
+      await sendAndWaitForAck(client, { type: 'subscribe', channel: 'chat/a' })
+      client.send(JSON.stringify({ type: 'message', channel: 'chat/a', event: 'sleep' }))
+      client.send(JSON.stringify({ id: 'p', type: 'subscribe', channel: 'presence/a' }))
+      client.send(JSON.stringify({ id: 'c', type: 'subscribe', channel: 'chat/a2' }))
+      await sleep(20)
+      client.terminate()
+
+      await waitFor(() => events.includes('disconnect'), 100)
+      await sleep(400)
+
+      assert.deepEqual(events, ['join:chat/a', 'subscribe:chat/a', 'disconnect', 'leave:chat/a'])
+    } finally {
+      client.terminate()
+      await socket.close()
+      await closeHttpServer(httpServer)
+    }
+  })
+
+  test('announces presence leave for a socket whose handler never settles', async ({ assert }) => {
+    const memberLeaves: string[] = []
+
+    class RoomChannel extends BaseChannel {
+      static pattern = 'presence/:roomId'
+      static options = { presence: true }
+
+      getPresenceInfo(socket: { id: string }) {
+        return { id: socket.id, data: {} }
+      }
+
+      async onMemberLeave(_socket: unknown, member: { id: string }) {
+        memberLeaves.push(member.id)
+      }
+    }
+
+    class HangingChannel extends BaseChannel {
+      static pattern = 'chat/:roomId'
+
+      @onMessage('hang')
+      async hang() {
+        await new Promise(() => {})
+      }
+    }
+
+    const httpServer = createServer()
+    const socket = new SocketService()
+    const router = new ChannelRouter()
+    const connectedIds: string[] = []
+    router.register(RoomChannel as any)
+    router.register(HangingChannel as any)
+    socket.setPresenceManager(new PresenceManager())
+    socket.on('connect', ({ socket: connected }) => {
+      connectedIds.push(connected.id)
+    })
+
+    // Bounds the close() in finally, which waits for the hung handler.
+    await socket.boot(httpServer, { websocket: { shutdownTimeout: 100 } }, router, makeLogger())
+    const port = await listen(httpServer)
+    const observer = await connectClient(port)
+    const ghost = await connectClient(port)
+    const updates: string[][] = []
+    observer.on('message', (raw) => {
+      const frame = JSON.parse(raw.toString())
+      if (frame.type === 'event' && frame.event === 'presence:update') {
+        updates.push(frame.data.users.map((user: { id: string }) => user.id))
+      }
+    })
+
+    try {
+      await waitFor(() => connectedIds.length === 2)
+      const [observerId, ghostId] = connectedIds
+      await sendAndWaitForAck(observer, { type: 'subscribe', channel: 'presence/c' })
+      await sendAndWaitForAck(ghost, { type: 'subscribe', channel: 'presence/c' })
+      await sendAndWaitForAck(ghost, { type: 'subscribe', channel: 'chat/c' })
+      ghost.send(JSON.stringify({ type: 'message', channel: 'chat/c', event: 'hang' }))
+      await sleep(20)
+      ghost.terminate()
+
+      await waitFor(() => memberLeaves.length > 0, 1000)
+      await sleep(50)
+
+      assert.deepEqual(memberLeaves, [ghostId])
+      assert.deepEqual(updates.at(-1), [observerId])
+    } finally {
+      observer.terminate()
+      ghost.terminate()
+      await socket.close()
+      await closeHttpServer(httpServer)
+    }
+  })
+
+  test('does not store a subscription whose socket closed during its middleware', async ({
+    assert,
+  }) => {
+    const events: string[] = []
+    const middlewareStarted = Promise.withResolvers<void>()
+    const releaseMiddleware = Promise.withResolvers<void>()
+
+    class SlowChannel extends BaseChannel {
+      static pattern = 'slow/:roomId'
+      static middlewares = [
+        async (_ctx: unknown, next: () => Promise<void>) => {
+          middlewareStarted.resolve()
+          await releaseMiddleware.promise
+          await next()
+        },
+      ]
+
+      async onJoin() {
+        events.push('join')
+      }
+    }
+
+    const httpServer = createServer()
+    const socket = new SocketService()
+    const router = new ChannelRouter()
+    router.register(SlowChannel as any)
+    socket.on('subscribe', () => {
+      events.push('subscribe')
+    })
+    socket.on('disconnect', () => {
+      events.push('disconnect')
+    })
+    await socket.boot(httpServer, {}, router, makeLogger())
+    const client = await connectClient(await listen(httpServer))
+
+    try {
+      client.send(JSON.stringify({ id: 'join', type: 'subscribe', channel: 'slow/a' }))
+      await middlewareStarted.promise
+      client.terminate()
+      await waitFor(() => events.includes('disconnect'), 1000)
+      releaseMiddleware.resolve()
+      await sleep(50)
+
+      assert.deepEqual(events, ['disconnect'])
+      assert.equal(socket.health().channels, 0)
+    } finally {
+      releaseMiddleware.resolve()
+      await socket.close()
+      await closeHttpServer(httpServer)
+    }
+  })
+
+  test('pairs join hooks that finish after their socket closed', async ({ assert }) => {
+    const events: string[] = []
+    const joinStarted = Promise.withResolvers<void>()
+    const releaseJoin = Promise.withResolvers<void>()
+
+    class RoomChannel extends BaseChannel {
+      static pattern = 'presence/:roomId'
+      static options = { presence: true }
+
+      getPresenceInfo() {
+        return { id: 'ghost', data: {} }
+      }
+
+      async onMemberJoin(_socket: unknown, member: { id: string }) {
+        events.push(`memberJoin:${member.id}`)
+      }
+
+      async onMemberLeave(_socket: unknown, member: { id: string }) {
+        events.push(`memberLeave:${member.id}`)
+      }
+
+      async onJoin() {
+        events.push('join')
+        joinStarted.resolve()
+        await releaseJoin.promise
+        events.push('join:done')
+      }
+
+      async onLeave() {
+        events.push('leave')
+      }
+    }
+
+    const httpServer = createServer()
+    const socket = new SocketService()
+    const presence = new PresenceManager()
+    const router = new ChannelRouter()
+    router.register(RoomChannel as any)
+    socket.setPresenceManager(presence)
+    socket.on('disconnect', () => {
+      events.push('disconnect')
+    })
+
+    await socket.boot(httpServer, {}, router, makeLogger())
+    const port = await listen(httpServer)
+    const ghost = await connectClient(port)
+
+    try {
+      ghost.send(JSON.stringify({ id: 'join', type: 'subscribe', channel: 'presence/a' }))
+      await joinStarted.promise
+      ghost.terminate()
+      await waitFor(() => events.includes('disconnect'), 1000)
+
+      releaseJoin.resolve()
+      await waitFor(() => events.includes('leave'), 1000)
+
+      // onMemberLeave follows onMemberJoin at release; onLeave waits for onJoin.
+      assert.deepEqual(events, [
+        'memberJoin:ghost',
+        'join',
+        'disconnect',
+        'memberLeave:ghost',
+        'join:done',
+        'leave',
+      ])
+      assert.equal(await presence.count('presence/a'), 0)
+      assert.equal(socket.health().channels, 0)
+    } finally {
+      releaseJoin.resolve()
+      ghost.terminate()
+      await socket.close()
+      await closeHttpServer(httpServer)
+    }
+  })
+
+  test('drops the presence of a closed socket whose onJoin never settles', async ({ assert }) => {
+    const joinStarted = Promise.withResolvers<void>()
+
+    class RoomChannel extends BaseChannel {
+      static pattern = 'presence/:roomId'
+      static options = { presence: true }
+
+      getPresenceInfo(socket: { id: string }) {
+        return { id: socket.id, data: {} }
+      }
+
+      async onJoin() {
+        joinStarted.resolve()
+        await new Promise(() => {})
+      }
+    }
+
+    const httpServer = createServer()
+    const socket = new SocketService()
+    const router = new ChannelRouter()
+    const presence = new PresenceManager()
+    router.register(RoomChannel as any)
+    socket.setPresenceManager(presence)
+
+    // Bounds the close() in finally, which waits for the hung handler.
+    await socket.boot(httpServer, { websocket: { shutdownTimeout: 100 } }, router, makeLogger())
+    const port = await listen(httpServer)
+    const ghost = await connectClient(port)
+
+    try {
+      ghost.send(JSON.stringify({ id: 'join', type: 'subscribe', channel: 'presence/n18' }))
+      await joinStarted.promise
+      assert.equal((await presence.snapshot('presence/n18')).count, 1)
+
+      ghost.terminate()
+      await waitFor(() => socket.connectionsCount === 0, 1000)
+      await sleep(20)
+
+      assert.equal((await presence.snapshot('presence/n18')).count, 0)
+    } finally {
+      ghost.terminate()
+      await socket.close()
+      await closeHttpServer(httpServer)
+    }
+  })
+
+  test('announces the leave of a stuck member to other instances on shutdown', async ({
+    assert,
+  }) => {
+    const handlerStarted = Promise.withResolvers<void>()
+    const memberLeaves: string[] = []
+
+    class RoomChannel extends BaseChannel {
+      static pattern = 'presence/:roomId'
+      static options = { presence: true }
+
+      getPresenceInfo(socket: { id: string }) {
+        return { id: socket.id, data: {} }
+      }
+
+      async onMemberLeave(_socket: unknown, member: { id: string }) {
+        memberLeaves.push(member.id)
+      }
+    }
+
+    class HangingChannel extends BaseChannel {
+      static pattern = 'chat/:roomId'
+
+      @onMessage('hang')
+      async hang() {
+        handlerStarted.resolve()
+        await new Promise(() => {})
+      }
+    }
+
+    const transport = { ...makeTransportConfig(), presenceTimeout: 20 }
+    const localHttpServer = createServer()
+    const remoteHttpServer = createServer()
+    const local = new SocketService()
+    const remote = new SocketService()
+    const localRouter = new ChannelRouter()
+    const remoteRouter = new ChannelRouter()
+    const connectedIds: string[] = []
+    localRouter.register(RoomChannel as any)
+    remoteRouter.register(RoomChannel as any)
+    remoteRouter.register(HangingChannel as any)
+    local.setPresenceManager(new PresenceManager())
+    remote.setPresenceManager(new PresenceManager())
+    local.on('connect', ({ socket: connected }) => {
+      connectedIds.push(connected.id)
+    })
+    remote.on('connect', ({ socket: connected }) => {
+      connectedIds.push(connected.id)
+    })
+
+    await local.boot(localHttpServer, { transport }, localRouter, makeLogger())
+    await remote.boot(
+      remoteHttpServer,
+      { transport, websocket: { shutdownTimeout: 300 } },
+      remoteRouter,
+      makeLogger()
+    )
+    const observer = await connectClient(await listen(localHttpServer))
+    await waitFor(() => connectedIds.length === 1)
+    const stuck = await connectClient(await listen(remoteHttpServer))
+    await waitFor(() => connectedIds.length === 2)
+    const [observerId, stuckId] = connectedIds
+    const updates: string[][] = []
+    observer.on('message', (raw) => {
+      const frame = JSON.parse(raw.toString())
+      if (frame.type === 'event' && frame.event === 'presence:update') {
+        updates.push(frame.data.users.map((user: { id: string }) => user.id))
+      }
+    })
+
+    try {
+      await sendAndWaitForAck(observer, { type: 'subscribe', channel: 'presence/o3' })
+      await sendAndWaitForAck(stuck, { type: 'subscribe', channel: 'presence/o3' })
+      await sendAndWaitForAck(stuck, { type: 'subscribe', channel: 'chat/o3' })
+      await waitFor(() => updates.at(-1)?.includes(stuckId) === true)
+      stuck.send(JSON.stringify({ type: 'message', channel: 'chat/o3', event: 'hang' }))
+      await handlerStarted.promise
+
+      await remote.close()
+      await sleep(50)
+
+      assert.deepEqual(memberLeaves, [stuckId])
+      assert.deepEqual(updates.at(-1), [observerId])
+    } finally {
+      observer.terminate()
+      stuck.terminate()
+      await local.close()
+      await remote.close()
+      await closeHttpServer(localHttpServer)
+      await closeHttpServer(remoteHttpServer)
+    }
+  }).timeout(10_000)
+
+  test('waits for leave hooks of sockets that closed before shutdown', async ({ assert }) => {
+    const { state, driver } = makeQuittingTransport()
+    const leaveStarted = Promise.withResolvers<void>()
+    const releaseLeave = Promise.withResolvers<void>()
+    const events: string[] = []
+    void state.disconnectStarted.promise.then(() => events.push('transport:disconnect'))
+
+    class RoomChannel extends BaseChannel<unknown, { 'room:member_left': { id: string } }> {
+      static pattern = 'presence/:roomId'
+      static options = { presence: true }
+
+      getPresenceInfo(socket: { id: string }) {
+        return { id: socket.id, data: {} }
+      }
+
+      async onMemberLeave(_socket: unknown, member: { id: string }) {
+        leaveStarted.resolve()
+        await releaseLeave.promise
+        this.broadcast('room:member_left', member)
+        events.push('memberLeave:done')
+      }
+    }
+
+    const httpServer = createServer()
+    const socket = new SocketService()
+    const router = new ChannelRouter()
+    router.register(RoomChannel as any)
+    socket.setPresenceManager(new PresenceManager())
+    await socket.boot(
+      httpServer,
+      { transport: { driver, presenceTimeout: 20 } },
+      router,
+      makeLogger()
+    )
+    const client = await connectClient(await listen(httpServer))
+
+    try {
+      await sendAndWaitForAck(client, { type: 'subscribe', channel: 'presence/a' })
+      client.terminate()
+      await leaveStarted.promise
+
+      // The hook is held until close() is under way, so close() must wait for it.
+      const closing = socket.close()
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      releaseLeave.resolve()
+      await closing
+
+      assert.deepEqual(events, ['memberLeave:done', 'transport:disconnect'])
+      assert.equal(state.publishesDuringDisconnect, 0)
+    } finally {
+      client.terminate()
+      await socket.close().catch(() => {})
+      await closeHttpServer(httpServer)
+    }
+  })
+
+  test('runs onMemberLeave once when sockets of one member close together', async ({ assert }) => {
+    const hooks: string[] = []
+
+    class RoomChannel extends BaseChannel {
+      static pattern = 'presence/:roomId'
+      static options = { presence: true }
+
+      getPresenceInfo() {
+        return { id: 'alice', data: {} }
+      }
+
+      async onMemberLeave(_socket: unknown, member: { id: string }) {
+        hooks.push(`memberLeave:${member.id}`)
+      }
+
+      async onLeave() {
+        hooks.push('leave')
+      }
+    }
+
+    const httpServer = createServer()
+    const socket = new SocketService()
+    const router = new ChannelRouter()
+    router.register(RoomChannel as any)
+    socket.setPresenceManager(new PresenceManager())
+    await socket.boot(httpServer, {}, router, makeLogger())
+    const port = await listen(httpServer)
+    const firstTab = await connectClient(port)
+    const secondTab = await connectClient(port)
+
+    try {
+      await sendAndWaitForAck(firstTab, { type: 'subscribe', channel: 'presence/a' })
+      await sendAndWaitForAck(secondTab, { type: 'subscribe', channel: 'presence/a' })
+
+      await socket.close()
+
+      assert.deepEqual(hooks.sort(), ['leave', 'leave', 'memberLeave:alice'])
+    } finally {
+      firstTab.terminate()
+      secondTab.terminate()
+      await socket.close()
+      await closeHttpServer(httpServer)
+    }
+  })
+
+  test('runs onMemberLeave once when the {held} tab of one member closes during its join')
+    .with([{ held: 'first' as const }, { held: 'second' as const }])
+    .run(async ({ assert }, { held }) => {
+      const joinStarted = Promise.withResolvers<void>()
+      const releaseJoin = Promise.withResolvers<void>()
+      const heldJoin = held === 'first' ? 1 : 2
+      const hooks: string[] = []
+      let joins = 0
+
+      class RoomChannel extends BaseChannel {
+        static pattern = 'presence/:roomId'
+        static options = { presence: true }
+
+        getPresenceInfo() {
+          return { id: 'alice', data: {} }
+        }
+
+        async onJoin() {
+          if (++joins !== heldJoin) return
+          joinStarted.resolve()
+          await releaseJoin.promise
+        }
+
+        async onMemberLeave(_socket: unknown, member: { id: string }) {
+          hooks.push(`memberLeave:${member.id}`)
+        }
+
+        async onLeave() {
+          hooks.push('leave')
+        }
+      }
+
+      const httpServer = createServer()
+      const socket = new SocketService()
+      const router = new ChannelRouter()
+      let disconnects = 0
+      router.register(RoomChannel as any)
+      socket.setPresenceManager(new PresenceManager())
+      socket.on('disconnect', () => {
+        disconnects++
+      })
+      await socket.boot(httpServer, {}, router, makeLogger())
+      const port = await listen(httpServer)
+      const firstTab = await connectClient(port)
+      const secondTab = await connectClient(port)
+      const subscribe = { type: 'subscribe', channel: 'presence/a' }
+
+      try {
+        if (held === 'first') {
+          firstTab.send(JSON.stringify(subscribe))
+          await joinStarted.promise
+          await sendAndWaitForAck(secondTab, subscribe)
+        } else {
+          await sendAndWaitForAck(firstTab, subscribe)
+          secondTab.send(JSON.stringify(subscribe))
+          await joinStarted.promise
+        }
+
+        // The first tab is released first, so it never holds the member's last local socket.
+        firstTab.terminate()
+        await waitFor(() => disconnects === 1)
+        secondTab.terminate()
+        await waitFor(() => disconnects === 2)
+        releaseJoin.resolve()
+        await waitFor(() => hooks.filter((hook) => hook === 'leave').length === 2)
+
+        assert.deepEqual(hooks.sort(), ['leave', 'leave', 'memberLeave:alice'])
+      } finally {
+        releaseJoin.resolve()
+        firstTab.terminate()
+        secondTab.terminate()
+        await socket.close()
+        await closeHttpServer(httpServer)
+      }
+    })
+
+  test('pairs member hooks when a member reconnects while its first join is running', async ({
+    assert,
+  }) => {
+    const joinStarted = Promise.withResolvers<void>()
+    const releaseJoin = Promise.withResolvers<void>()
+    const hooks: string[] = []
+    const connectedIds: string[] = []
+    let blockJoin = true
+
+    class RoomChannel extends BaseChannel<
+      unknown,
+      { 'member:joined': { id: string }; 'member:left': { id: string } }
+    > {
+      static pattern = 'presence/:roomId'
+      static options = { presence: true }
+
+      getPresenceInfo(socket: { id: string }) {
+        return { id: socket.id === connectedIds[0] ? 'observer' : 'x', data: {} }
+      }
+
+      async onMemberJoin(_socket: unknown, member: { id: string }) {
+        hooks.push(`joined:${member.id}`)
+        this.broadcast('member:joined', member)
+      }
+
+      async onMemberLeave(_socket: unknown, member: { id: string }) {
+        hooks.push(`left:${member.id}`)
+        this.broadcast('member:left', member)
+      }
+
+      async onJoin(socket: { id: string }) {
+        if (socket.id === connectedIds[0] || !blockJoin) return
+        blockJoin = false
+        joinStarted.resolve()
+        await releaseJoin.promise
+      }
+    }
+
+    const httpServer = createServer()
+    const socket = new SocketService()
+    const router = new ChannelRouter()
+    router.register(RoomChannel as any)
+    socket.setPresenceManager(new PresenceManager())
+    socket.on('connect', ({ socket: connected }) => {
+      connectedIds.push(connected.id)
+    })
+    await socket.boot(httpServer, {}, router, makeLogger())
+    const port = await listen(httpServer)
+    const observer = await connectClient(port)
+    await waitFor(() => connectedIds.length === 1)
+    const memberEvents: string[] = []
+    observer.on('message', (raw) => {
+      const frame = JSON.parse(raw.toString())
+      if (frame.type === 'event' && frame.event.startsWith('member:')) {
+        memberEvents.push(`${frame.event}:${frame.data.id}`)
+      }
+    })
+    await sendAndWaitForAck(observer, { type: 'subscribe', channel: 'presence/a' })
+    const firstTab = await connectClient(port)
+    let secondTab: WebSocket | undefined
+
+    try {
+      firstTab.send(JSON.stringify({ type: 'subscribe', channel: 'presence/a' }))
+      await joinStarted.promise
+      firstTab.terminate()
+      await waitFor(() => socket.connectionsCount === 1)
+
+      secondTab = await connectClient(port)
+      await sendAndWaitForAck(secondTab, { type: 'subscribe', channel: 'presence/a' })
+      releaseJoin.resolve()
+      await sleep(50)
+
+      assert.deepEqual(hooks, ['joined:observer', 'joined:x', 'left:x', 'joined:x'])
+      assert.deepEqual(memberEvents, ['member:joined:x', 'member:left:x', 'member:joined:x'])
+    } finally {
+      releaseJoin.resolve()
+      firstTab.terminate()
+      secondTab?.terminate()
+      observer.terminate()
+      await socket.close()
+      await closeHttpServer(httpServer)
+    }
+  })
+
+  test('updates peers at once when a member leaves while its onMemberJoin is running', async ({
+    assert,
+  }) => {
+    const memberJoinStarted = Promise.withResolvers<void>()
+    const releaseMemberJoin = Promise.withResolvers<void>()
+    const hooks: string[] = []
+    const connectedIds: string[] = []
+    const memberIds = ['observer', 'm2', 'm3']
+
+    class RoomChannel extends BaseChannel {
+      static pattern = 'presence/:roomId'
+      static options = { presence: true }
+
+      getPresenceInfo(socket: { id: string }) {
+        return { id: memberIds[connectedIds.indexOf(socket.id)], data: {} }
+      }
+
+      async onMemberJoin(_socket: unknown, member: { id: string }) {
+        if (member.id !== 'm2') return
+        memberJoinStarted.resolve()
+        await releaseMemberJoin.promise
+      }
+
+      async onMemberLeave(_socket: unknown, member: { id: string }) {
+        hooks.push(`left:${member.id}`)
+      }
+    }
+
+    const httpServer = createServer()
+    const socket = new SocketService()
+    const router = new ChannelRouter()
+    router.register(RoomChannel as any)
+    const presence = new PresenceManager()
+    socket.setPresenceManager(presence)
+    socket.on('connect', ({ socket: connected }) => {
+      connectedIds.push(connected.id)
+    })
+    await socket.boot(httpServer, {}, router, makeLogger())
+    const port = await listen(httpServer)
+    const observer = await connectClient(port)
+    await waitFor(() => connectedIds.length === 1)
+    let view: string[] = []
+    observer.on('message', (raw) => {
+      const frame = JSON.parse(raw.toString())
+      if (frame.event === 'presence:update') {
+        view = frame.data.users.map((user: { id: string }) => user.id)
+      }
+    })
+    await sendAndWaitForAck(observer, { type: 'subscribe', channel: 'presence/a' })
+    const second = await connectClient(port)
+    await waitFor(() => connectedIds.length === 2)
+    let third: WebSocket | undefined
+
+    try {
+      second.send(JSON.stringify({ type: 'subscribe', channel: 'presence/a' }))
+      await memberJoinStarted.promise
+      third = await connectClient(port)
+      await sendAndWaitForAck(third, { type: 'subscribe', channel: 'presence/a' })
+      await waitFor(() => view.length === 3)
+
+      second.terminate()
+      await waitFor(() => view.length === 2, 1000)
+      assert.deepEqual(view, ['observer', 'm3'])
+      assert.deepEqual(hooks, [])
+
+      releaseMemberJoin.resolve()
+      await waitFor(() => hooks.length === 1, 1000)
+      assert.deepEqual(hooks, ['left:m2'])
+      assert.equal(await presence.count('presence/a'), 2)
+    } finally {
+      releaseMemberJoin.resolve()
+      second.terminate()
+      third?.terminate()
+      observer.terminate()
+      await socket.close()
+      await closeHttpServer(httpServer)
+    }
+  })
+
+  test('skips onMemberLeave when the member rejoined while its onMemberJoin was running', async ({
+    assert,
+  }) => {
+    const memberJoinStarted = Promise.withResolvers<void>()
+    const releaseMemberJoin = Promise.withResolvers<void>()
+    const hooks: string[] = []
+    const connectedIds: string[] = []
+    const memberIds = ['observer', 'm2', 'm3', 'm2']
+    let blockMemberJoin = true
+
+    class RoomChannel extends BaseChannel {
+      static pattern = 'presence/:roomId'
+      static options = { presence: true }
+
+      getPresenceInfo(socket: { id: string }) {
+        return { id: memberIds[connectedIds.indexOf(socket.id)], data: {} }
+      }
+
+      async onMemberJoin(_socket: unknown, member: { id: string }) {
+        hooks.push(`joined:${member.id}`)
+        if (member.id !== 'm2' || !blockMemberJoin) return
+        blockMemberJoin = false
+        memberJoinStarted.resolve()
+        await releaseMemberJoin.promise
+      }
+
+      async onMemberLeave(_socket: unknown, member: { id: string }) {
+        hooks.push(`left:${member.id}`)
+      }
+    }
+
+    const httpServer = createServer()
+    const socket = new SocketService()
+    const router = new ChannelRouter()
+    router.register(RoomChannel as any)
+    const presence = new PresenceManager()
+    socket.setPresenceManager(presence)
+    socket.on('connect', ({ socket: connected }) => {
+      connectedIds.push(connected.id)
+    })
+    await socket.boot(httpServer, {}, router, makeLogger())
+    const port = await listen(httpServer)
+    const observer = await connectClient(port)
+    await waitFor(() => connectedIds.length === 1)
+    let view: string[] = []
+    observer.on('message', (raw) => {
+      const frame = JSON.parse(raw.toString())
+      if (frame.event === 'presence:update') {
+        view = frame.data.users.map((user: { id: string }) => user.id)
+      }
+    })
+    await sendAndWaitForAck(observer, { type: 'subscribe', channel: 'presence/a' })
+    const second = await connectClient(port)
+    await waitFor(() => connectedIds.length === 2)
+    let third: WebSocket | undefined
+
+    try {
+      second.send(JSON.stringify({ type: 'subscribe', channel: 'presence/a' }))
+      await memberJoinStarted.promise
+      third = await connectClient(port)
+      await sendAndWaitForAck(third, { type: 'subscribe', channel: 'presence/a' })
+      await waitFor(() => view.length === 3)
+
+      second.terminate()
+      await waitFor(() => view.length === 2, 1000)
+      const rejoined = await connectClient(port)
+      await sendAndWaitForAck(rejoined, { type: 'subscribe', channel: 'presence/a' })
+
+      releaseMemberJoin.resolve()
+      await sleep(50)
+      assert.deepEqual(view, ['observer', 'm3', 'm2'])
+      assert.deepEqual(hooks, ['joined:observer', 'joined:m2', 'joined:m3', 'joined:m2'])
+      rejoined.terminate()
+    } finally {
+      releaseMemberJoin.resolve()
+      second.terminate()
+      third?.terminate()
+      observer.terminate()
+      await socket.close()
+      await closeHttpServer(httpServer)
+    }
+  })
+
+  test('announces a member that leaves while its onJoin is running', async ({ assert }) => {
+    const joinStarted = Promise.withResolvers<void>()
+    const releaseJoin = Promise.withResolvers<void>()
+    let blockJoin = true
+
+    class RoomChannel extends BaseChannel {
+      static pattern = 'presence/:roomId'
+      static options = { presence: true }
+
+      getPresenceInfo(socket: { id: string }) {
+        return { id: socket.id, data: {} }
+      }
+
+      async onJoin() {
+        if (!blockJoin) return
+        blockJoin = false
+        joinStarted.resolve()
+        await releaseJoin.promise
+      }
+    }
+
+    const httpServer = createServer()
+    const socket = new SocketService()
+    const router = new ChannelRouter()
+    const connectedIds: string[] = []
+    router.register(RoomChannel as any)
+    socket.setPresenceManager(new PresenceManager())
+    socket.on('connect', ({ socket: connected }) => {
+      connectedIds.push(connected.id)
+    })
+    await socket.boot(httpServer, {}, router, makeLogger())
+    const port = await listen(httpServer)
+    const joiner = await connectClient(port)
+    await waitFor(() => connectedIds.length === 1)
+    const observer = await connectClient(port)
+    await waitFor(() => connectedIds.length === 2)
+    const [joinerId, observerId] = connectedIds
+    const updates: string[][] = []
+    observer.on('message', (raw) => {
+      const frame = JSON.parse(raw.toString())
+      if (frame.type === 'event' && frame.event === 'presence:update') {
+        updates.push(frame.data.users.map((user: { id: string }) => user.id))
+      }
+    })
+
+    try {
+      joiner.send(JSON.stringify({ type: 'subscribe', channel: 'presence/a' }))
+      await joinStarted.promise
+      const joined = (await sendAndWaitForAck(observer, {
+        type: 'subscribe',
+        channel: 'presence/a',
+      })) as { data: { presenceData: { users: { id: string }[] } } }
+      assert.includeMembers(
+        joined.data.presenceData.users.map((user) => user.id),
+        [joinerId]
+      )
+
+      // The joiner's onJoin is still running; its leave is announced anyway.
+      joiner.terminate()
+      await waitFor(() => updates.at(-1)?.join() === observerId, 1000)
+    } finally {
+      releaseJoin.resolve()
+      joiner.terminate()
+      observer.terminate()
+      await socket.close()
+      await closeHttpServer(httpServer)
+    }
+  })
+
+  test('waits for hung hooks once across closeWebSockets and close', async ({ assert }) => {
+    const leaveStarted = Promise.withResolvers<void>()
+
+    class ChatChannel extends BaseChannel {
+      static pattern = 'chat/:roomId'
+
+      async onLeave() {
+        leaveStarted.resolve()
+        await new Promise(() => {})
+      }
+    }
+
+    const httpServer = createServer()
+    const socket = new SocketService()
+    const router = new ChannelRouter()
+    router.register(ChatChannel as any)
+    await socket.boot(httpServer, { websocket: { shutdownTimeout: 300 } }, router, makeLogger())
+    const client = await connectClient(await listen(httpServer))
+
+    try {
+      await sendAndWaitForAck(client, { type: 'subscribe', channel: 'chat/a' })
+
+      // The provider's shutdown sequence: close clients before the HTTP drain, then close().
+      const started = Date.now()
+      await socket.closeWebSockets()
+      await leaveStarted.promise
+      await socket.close()
+      const elapsed = Date.now() - started
+
+      assert.isAtLeast(elapsed, 290)
+      assert.isBelow(elapsed, 500)
+    } finally {
+      client.terminate()
+      await socket.close().catch(() => {})
+      await closeHttpServer(httpServer)
+    }
+  })
   test('resolves close when the transport does not disconnect before the shutdown deadline', async ({
     assert,
   }) => {

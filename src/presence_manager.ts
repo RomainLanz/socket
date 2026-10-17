@@ -58,10 +58,12 @@ export class PresenceManager {
   }
 
   /**
-   * Removes a user from a channel.
+   * Removes a user from a channel. Returns the removed user when it was the
+   * last local socket of that member.
    */
-  leave(channel: string, socket: PresenceSocket): void {
+  leave(channel: string, socket: PresenceSocket): PresenceUser | undefined {
     const channelPresence = this.#presence.get(channel)
+    const user = channelPresence?.get(socket.id)
 
     if (channelPresence) {
       channelPresence.delete(socket.id)
@@ -72,6 +74,10 @@ export class PresenceManager {
     }
 
     this.#deleteSocketPresence(socket, channel)
+    const stillPresent = [...(channelPresence?.values() ?? [])].some(
+      (other) => other.id === user?.id
+    )
+    return stillPresent ? undefined : user
   }
 
   /**

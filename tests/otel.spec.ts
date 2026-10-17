@@ -141,6 +141,65 @@ test.group('socket instrumentation', (group) => {
     }
   })
 
+  test('releases active subscriptions created while their socket disconnects', async ({
+    assert,
+  }) => {
+    const joinStarted = Promise.withResolvers<void>()
+    const releaseJoin = Promise.withResolvers<void>()
+
+    class SlowChannel extends BaseChannel {
+      static pattern = 'slow/:roomId'
+
+      async onJoin() {
+        joinStarted.resolve()
+        await releaseJoin.promise
+      }
+    }
+
+    const exporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE)
+    const reader = new PeriodicExportingMetricReader({ exporter, exportIntervalMillis: 60_000 })
+    const meterProvider = new MeterProvider({ readers: [reader] })
+    const instrumentation = new SocketInstrumentation()
+    instrumentation.setMeterProvider(meterProvider)
+    const httpServer = createServer()
+    const socket = new SocketService()
+    const router = new ChannelRouter()
+    const disconnected = Promise.withResolvers<void>()
+    router.register(SlowChannel as any)
+    socket.on('disconnect', () => disconnected.resolve())
+    await socket.boot(httpServer, {}, router, makeLogger())
+    const port = await listen(httpServer)
+    const client = await connectClient(port)
+
+    try {
+      client.send(JSON.stringify({ id: 'subscribe', type: 'subscribe', channel: 'slow/general' }))
+      await joinStarted.promise
+      client.terminate()
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      releaseJoin.resolve()
+      await disconnected.promise
+
+      await meterProvider.forceFlush()
+      const activeSubscriptions =
+        exporter
+          .getMetrics()
+          .flatMap((resource) => resource.scopeMetrics)
+          .flatMap((scope) => scope.metrics)
+          .find((item) => item.descriptor.name === 'rlanz_socket_subscriptions_active')
+          ?.dataPoints.reduce((total, point) => total + (point.value as number), 0) ?? 0
+
+      assert.equal(activeSubscriptions, 0)
+      const disconnectSpan = getFinishedSpans().find((span) => span.name === 'socket disconnect')
+      assert.equal(disconnectSpan?.attributes['socket.disconnect.subscriptions'], 0)
+    } finally {
+      releaseJoin.resolve()
+      instrumentation.disable()
+      await socket.close()
+      await closeHttpServer(httpServer)
+      await meterProvider.shutdown()
+    }
+  })
+
   test('uses the package version as its instrumentation version', ({ assert }) => {
     const instrumentation = new SocketInstrumentation()
 
