@@ -2168,6 +2168,27 @@ test.group('socket service', () => {
     }
   }).timeout(10_000)
 
+  test('trusts X-Forwarded-Proto for the same-origin default behind a TLS proxy', async ({
+    assert,
+  }) => {
+    const httpServer = createServer()
+    const socket = new SocketService()
+    await socket.boot(httpServer, {}, new ChannelRouter(), makeLogger())
+    const port = await listen(httpServer)
+    const { client, response } = await upgradeRawWebSocket(port, '/socket', [
+      `Origin: https://127.0.0.1:${port}`,
+      'X-Forwarded-Proto: https',
+    ])
+
+    try {
+      assert.isTrue(response.startsWith('HTTP/1.1 101 Switching Protocols'))
+    } finally {
+      client.destroy()
+      await socket.close()
+      await closeHttpServer(httpServer)
+    }
+  }).timeout(10_000)
+
   test('uses a configured origin policy instead of the same-origin default', async ({ assert }) => {
     const httpServer = createServer()
     const socket = new SocketService()
@@ -2218,6 +2239,12 @@ test.group('socket service', () => {
         policy: ['https://app.example'],
         requestOrigin: 'https://app.example',
         status: '101 Switching Protocols',
+      },
+      // Origins match exactly: a prefix of an allowed origin is another site.
+      {
+        policy: 'https://app.example.com',
+        requestOrigin: 'https://app.example.co',
+        status: '403 Forbidden',
       },
     ]
 
@@ -2394,6 +2421,35 @@ test.group('socket service', () => {
       assert.isTrue(client.destroyed)
     } finally {
       client.destroy()
+      await socket.close()
+      await closeHttpServer(httpServer)
+    }
+  }).timeout(10_000)
+
+  test('keeps sockets that answer the heartbeat ping', async ({ assert }) => {
+    const httpServer = createServer()
+    const socket = new SocketService()
+    let disconnected = false
+    socket.on('disconnect', () => {
+      disconnected = true
+    })
+
+    await socket.boot(
+      httpServer,
+      { websocket: { pingInterval: '10ms', pingTimeout: '20ms' } },
+      new ChannelRouter(),
+      makeLogger()
+    )
+    // The ws client answers pings with pongs on its own.
+    const client = await connectClient(await listen(httpServer))
+
+    try {
+      await sleep(150)
+
+      assert.isFalse(disconnected)
+      assert.equal(socket.connectionsCount, 1)
+    } finally {
+      client.terminate()
       await socket.close()
       await closeHttpServer(httpServer)
     }

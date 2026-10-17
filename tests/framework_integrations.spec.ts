@@ -1115,4 +1115,27 @@ test.group('framework channel lifecycle', () => {
     feed.unmount()
     socket.disconnect()
   })
+
+  test('Vue releases its channel lease on unmount', async ({ assert, cleanup }) => {
+    const { browserSockets, restore } = installBrowserWebSocket()
+    cleanup(restore)
+
+    const socket = new Socket<AppSocket>({ url: 'ws://example.test', autoReconnect: false })
+    const connection = socket.connect()
+    browserSockets[0].open()
+    await connection
+    const app = mountVue(socket, () => {
+      vue.useChannel('chat/:room', { room: 'general' })
+    })
+    await flushTransitions()
+    const channel = socket.channel('chat/:room', { room: 'general' })
+    assert.isTrue(channel.active)
+
+    app.unmount()
+    await flushTransitions()
+
+    assert.isFalse(channel.subscribed)
+    assert.deepEqual(browserSockets[0].requests, ['subscribe', 'unsubscribe'])
+    socket.disconnect()
+  })
 })

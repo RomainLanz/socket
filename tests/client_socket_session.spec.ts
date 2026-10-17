@@ -299,6 +299,27 @@ test.group('client socket session', () => {
     assert.deepEqual(notices, ['current'])
   })
 
+  test('rejects pending acknowledgements when the connection closes', async ({ assert }) => {
+    const sockets: FakeWebSocket[] = []
+    const session = new ClientSocketSession({
+      buildUrl: () => 'ws://localhost/socket',
+      autoReconnect: false,
+      createWebSocket(url) {
+        const socket = new FakeWebSocket(url)
+        sockets.push(socket)
+        return socket as unknown as WebSocket
+      },
+    })
+    const connection = session.connect()
+    sockets[0].emit('open')
+    await connection
+
+    const request = session.sendRequest({ type: 'subscribe', channel: 'chat/general' })
+    sockets[0].emitClose(1006)
+
+    await assert.rejects(() => request, 'Socket disconnected')
+  })
+
   test('stops opening when a connected state callback disconnects reentrantly', async ({
     assert,
   }) => {
