@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { Bus } from '@boringnode/bus'
-import type { Serializable, TransportFactory } from '@boringnode/bus/types/main'
+import type { Serializable, TransportFactory } from '@boringnode/bus/types/core'
 import type { PresenceSocket } from './presence_manager.js'
 import { PresenceSocketFrame, type SerializablePresenceSocket } from './presence_socket_frame.js'
 import { parseDuration, type Duration } from './duration.js'

@@ -1,4 +1,4 @@
-import type { Serializable } from '@boringnode/bus/types/main'
+import type { Serializable } from '@boringnode/bus/types/core'
 import { PRESENCE_DATA_KEY, type PresenceSocket, type PresenceUser } from './presence_manager.js'
 
 type SerializablePresenceUser = {

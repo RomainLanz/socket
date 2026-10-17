@@ -475,19 +475,22 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@boringnode/bus@npm:^0.9.1":
-  version: 0.9.1
-  resolution: "@boringnode/bus@npm:0.9.1"
+"@boringnode/bus@npm:^0.10.0":
+  version: 0.10.0
+  resolution: "@boringnode/bus@npm:0.10.0"
   dependencies:
     "@paralleldrive/cuid2": "npm:^3.3.0"
-    "@poppinss/utils": "npm:^7.0.1"
+    "@poppinss/utils": "npm:^7.1.2"
     object-hash: "npm:^3.0.0"
   peerDependencies:
-    ioredis: ^5.0.0
+    ioredis: ^5.0.0 || ^6.0.0
+    mqtt: ^5.16.0
   peerDependenciesMeta:
     ioredis:
       optional: true
-  checksum: 10c0/ca6526a5a677f5a099e751a3225859c1ff5c66d55da550503a53225478a5ae942d0845f167c8bada76e1cc397fb76b94e9bd2c577f9d937dc5df5f5a7b8474d0
+    mqtt:
+      optional: true
+  checksum: 10c0/3c3789e0ee9a89f10a8c7f7c3edee4295056618955b893387ad75518533a4efbede09fd5b6a02ca6c78e941efce7baf640898d51ba604ff60a83b3816478908b
   languageName: node
   linkType: hard
 
@@ -1883,6 +1886,19 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@poppinss/utils@npm:^7.1.2":
+  version: 7.1.2
+  resolution: "@poppinss/utils@npm:7.1.2"
+  dependencies:
+    "@poppinss/exception": "npm:^1.2.3"
+    "@poppinss/object-builder": "npm:^1.1.0"
+    "@poppinss/string": "npm:^1.7.2"
+    "@poppinss/types": "npm:^1.2.1"
+    flattie: "npm:^1.1.1"
+  checksum: 10c0/6e26ea3c7158e28c069602fe83acba0bfbc70fac1ebde63f009c86e8d12949e7dfc36937986b6043ac2ce0f1f2e477f7238edf71066a662025774f7a8bb69c74
+  languageName: node
+  linkType: hard
+
 "@poppinss/validator-lite@npm:^2.1.2":
   version: 2.1.2
   resolution: "@poppinss/validator-lite@npm:2.1.2"
@@ -1914,7 +1930,7 @@ __metadata:
     "@adonisjs/assembler": "npm:^8.0.0"
     "@adonisjs/core": "npm:^7.6.0"
     "@adonisjs/tsconfig": "npm:^2.0.0"
-    "@boringnode/bus": "npm:^0.9.1"
+    "@boringnode/bus": "npm:^0.10.0"
     "@boringnode/route-matcher": "npm:^0.1.1"
     "@japa/assert": "npm:^4.2.0"
     "@japa/runner": "npm:^5.3.0"

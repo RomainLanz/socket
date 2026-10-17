@@ -5,6 +5,38 @@ import { PRESENCE_DATA_KEY } from '../src/presence_manager.js'
 import { SocketBus } from '../src/socket_bus.js'
 import { DEFAULT_RETRY_QUEUE_MAX_SIZE } from '../src/socket_bus.js'
 
+/** Transport double whose publications fail until `available` is set. */
+function makeFlakyTransport() {
+  const state = {
+    available: false,
+    delivered: [] as unknown[],
+    reconnect: undefined as (() => Promise<void> | void) | undefined,
+  }
+  const driver = () => {
+    const transport = {
+      setId() {
+        return transport
+      },
+      onReconnect(callback: () => Promise<void> | void) {
+        state.reconnect = callback
+      },
+      async publish(_channel: string, message: unknown) {
+        if (!state.available) {
+          throw new Error('transport unavailable')
+        }
+        state.delivered.push(message)
+      },
+      async subscribe() {},
+      async unsubscribe() {},
+      async disconnect() {},
+    }
+
+    return transport
+  }
+
+  return { state, driver: driver as any }
+}
+
 test.group('SocketBus', () => {
   test('rejects invalid retry queue limits', ({ assert }) => {
     assert.throws(
@@ -111,6 +143,29 @@ test.group('SocketBus', () => {
     assert.deepEqual(
       delivered.map((message) => (message as any).event),
       ['second', 'third']
+    )
+
+    await bus.close()
+  })
+
+  test('keeps queued publications when a duplicate reaches a full queue', async ({ assert }) => {
+    const { state, driver } = makeFlakyTransport()
+    const bus = new SocketBus(
+      { driver, retryQueue: { maxSize: 2 } },
+      { channel() {}, broadcast() {}, presenceSockets: () => [] }
+    )
+
+    bus.publishBroadcast('first', null)
+    bus.publishBroadcast('second', null)
+    bus.publishBroadcast('second', null)
+    await new Promise<void>((resolve) => setImmediate(resolve))
+
+    state.available = true
+    await state.reconnect?.()
+
+    assert.deepEqual(
+      state.delivered.map((message) => (message as any).event),
+      ['first', 'second']
     )
 
     await bus.close()
