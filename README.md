@@ -835,8 +835,12 @@ heartbeat state, message queues, and channel subscriptions. Set memory and file 
 cap connections at the edge, and load test realistic connection counts, payloads, message rates, and
 broadcast fan-out.
 
-Slow consumers are disconnected when `maxBufferedAmount` is exceeded. Oversized outbound messages
-are rejected rather than buffered or retried.
+Slow consumers are disconnected when `maxBufferedAmount` is exceeded. An outbound message larger
+than `maxOutboundPayload` is not sent and a warning is logged; recipients stay connected. A
+broadcast is dropped for every local recipient. An oversized acknowledgement is replaced by an error
+acknowledgement, `Response too big`, so the client request rejects instead of timing out. For a
+subscribe, the new subscription is rolled back first, leave hooks included. When a long request id
+makes even the error acknowledgement too big, the connection is closed with `1009`.
 
 ### Production checklist
 

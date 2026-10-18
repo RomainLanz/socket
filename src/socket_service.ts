@@ -71,6 +71,7 @@ const CLOSE_POLICY_VIOLATION = 1008
 const CLOSE_MESSAGE_TOO_BIG = 1009
 const CLOSE_OUTBOUND_BUFFER_LIMIT = 'Socket outbound buffer limit exceeded'
 const CLOSE_OUTBOUND_MESSAGE_TOO_BIG = 'Socket outbound message too big'
+const RESPONSE_TOO_BIG = 'Response too big'
 const SERVER_DISCONNECT_REASON = 'Socket server disconnected'
 const SERVICE_RESTART_REASON = 'Socket service restarting'
 
@@ -122,15 +123,6 @@ function serializeFrame(frame: ServerProtocolMessage): string {
   return JSON.stringify(frame)
 }
 
-function sendFrame(
-  connection: WebSocket,
-  frame: ServerProtocolMessage,
-  config: OutboundMessageConfig
-): boolean {
-  const serializedFrame = serializeFrame(frame)
-  return sendSerializedFrameWithBackpressure(connection, serializedFrame, config)
-}
-
 function sendSerializedFrameWithBackpressure(
   connection: WebSocket,
   serializedFrame: string,
@@ -141,11 +133,6 @@ function sendSerializedFrameWithBackpressure(
   }
 
   const payloadSize = Buffer.byteLength(serializedFrame)
-  if (payloadSize > config.maxOutboundPayload) {
-    closeConnection(connection, CLOSE_MESSAGE_TOO_BIG, CLOSE_OUTBOUND_MESSAGE_TOO_BIG)
-    return false
-  }
-
   if (connection.bufferedAmount + payloadSize > config.maxBufferedAmount) {
     closeAndTerminate(connection, CLOSE_POLICY_VIOLATION, CLOSE_OUTBOUND_BUFFER_LIMIT)
     return false
@@ -609,11 +596,7 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
       const message = Message.fromTransport(data.toString())
 
       if (message.type === 'ping') {
-        sendFrame(
-          socket.raw.connection,
-          { id: message.id, type: 'pong' },
-          this.#outboundMessageConfig
-        )
+        this.#sendFrame(socket.raw.connection, { id: message.id, type: 'pong' })
         return
       }
 
@@ -630,12 +613,11 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
               // Logging must never prevent a protocol response.
             }
 
-            sendFrame(
+            this.#sendFrame(
               connection,
               message.id === undefined
                 ? { type: 'error', error: 'Unexpected socket error' }
-                : Reply.error(message.id, 'Unexpected socket error').toFrame(),
-              this.#outboundMessageConfig
+                : Reply.error(message.id, 'Unexpected socket error').toFrame()
             )
           })
         },
@@ -704,7 +686,7 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
     message: TransportMessage
   ): Promise<void> {
     if (!message.valid) {
-      sendFrame(socket.raw.connection, message.toRejectionFrame(), this.#outboundMessageConfig)
+      this.#sendFrame(socket.raw.connection, message.toRejectionFrame())
       return
     }
 
@@ -718,7 +700,17 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
         }
 
         await subscribeChannel.tracePromise(async () => {
-          const result = await this.#channelSubscriptions?.subscribe(socket, message.channel)
+          let result = await this.#channelSubscriptions?.subscribe(socket, message.channel)
+          let reply = Reply.fromSubscribeResult(message.id, result).toFrame()
+
+          // The client reports an ack too big to send as a failed subscribe,
+          // so the new subscription is rolled back, leave hooks included,
+          // before the error ack.
+          if (result?.created && this.#exceedsOutboundPayload(serializeFrame(reply))) {
+            await this.#channelSubscriptions!.leave(socket, message.channel)
+            result = { created: false, ack: { ok: false, error: RESPONSE_TOO_BIG } }
+            reply = Reply.fromSubscribeResult(message.id, result).toFrame()
+          }
 
           traceMessage.created = result?.created ?? false
           traceMessage.ok = result?.ack.ok ?? false
@@ -730,11 +722,7 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
             this.#emitLifecycleEvent('subscribe', { socket, channel: message.channel })
           }
 
-          sendFrame(
-            socket.raw.connection,
-            Reply.fromSubscribeResult(message.id, result).toFrame(),
-            this.#outboundMessageConfig
-          )
+          this.#sendFrame(socket.raw.connection, reply)
         }, traceMessage)
         return
       }
@@ -751,11 +739,7 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
           if (traceMessage.removed) {
             this.#emitLifecycleEvent('unsubscribe', { socket, channel: message.channel })
           }
-          sendFrame(
-            socket.raw.connection,
-            Reply.ok(message.id).toFrame(),
-            this.#outboundMessageConfig
-          )
+          this.#sendFrame(socket.raw.connection, Reply.ok(message.id).toFrame())
         }, traceMessage)
         return
       }
@@ -785,11 +769,7 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
         traceMessage.error = ack.error
       }
 
-      sendFrame(
-        socket.raw.connection,
-        Reply.fromChannelAck(message.id, ack).toFrame(),
-        this.#outboundMessageConfig
-      )
+      this.#sendFrame(socket.raw.connection, Reply.fromChannelAck(message.id, ack).toFrame())
     }, traceMessage)
   }
 
@@ -829,7 +809,7 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
       },
 
       emit: (event, data) => {
-        this.#sendSerializedEventFrame(connection, serializeFrame({ type: 'event', event, data }))
+        this.#sendSerializedFrame(connection, serializeFrame({ type: 'event', event, data }))
       },
 
       disconnect() {
@@ -916,12 +896,46 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
     }, message)
   }
 
-  #sendSerializedEventFrame(connection: WebSocket, serializedFrame: string): boolean {
+  #sendFrame(connection: WebSocket, frame: ServerProtocolMessage): boolean {
+    const serializedFrame = serializeFrame(frame)
+
+    // A dropped acknowledgement would leave the client waiting for its timeout.
+    if (frame.type === 'ack' && this.#exceedsOutboundPayload(serializedFrame)) {
+      const errorFrame = serializeFrame(Reply.error(frame.id, RESPONSE_TOO_BIG).toFrame())
+      // A long request id can make even the error too big; closing is the only answer left.
+      if (this.#exceedsOutboundPayload(errorFrame)) {
+        closeConnection(connection, CLOSE_MESSAGE_TOO_BIG, CLOSE_OUTBOUND_MESSAGE_TOO_BIG)
+        return false
+      }
+      return this.#sendSerializedFrame(connection, errorFrame)
+    }
+
+    return this.#sendSerializedFrame(connection, serializedFrame)
+  }
+
+  #sendSerializedFrame(connection: WebSocket, serializedFrame: string): boolean {
+    if (this.#exceedsOutboundPayload(serializedFrame)) return false
+
     return sendSerializedFrameWithBackpressure(
       connection,
       serializedFrame,
       this.#outboundMessageConfig
     )
+  }
+
+  /**
+   * Oversized messages are the application's doing, not the recipient's, so
+   * they are dropped with a warning and the connection stays open.
+   */
+  #exceedsOutboundPayload(serializedFrame: string): boolean {
+    const size = Buffer.byteLength(serializedFrame)
+    if (size <= this.#outboundMessageConfig.maxOutboundPayload) return false
+
+    this.#warn(
+      `dropped an outbound message of ${size} bytes over websocket.maxOutboundPayload (%d bytes)`,
+      this.#outboundMessageConfig.maxOutboundPayload
+    )
+    return true
   }
 
   #emitToChannelLocally(
@@ -931,6 +945,8 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
     except: string[] = [],
     serializedFrame = serializeFrame({ type: 'event', channel, event, data })
   ): number {
+    // Checked once so a large channel logs one warning.
+    if (this.#exceedsOutboundPayload(serializedFrame)) return 0
     let delivered = 0
 
     for (const socketId of this.#channelSubscriptions?.getSocketIds(channel) ?? []) {
@@ -939,7 +955,7 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
       }
 
       const socket = this.#sockets.get(socketId)
-      if (socket && this.#sendSerializedEventFrame(socket.raw.connection, serializedFrame)) {
+      if (socket && this.#sendSerializedFrame(socket.raw.connection, serializedFrame)) {
         delivered += 1
       }
     }
@@ -952,10 +968,11 @@ export class SocketService<User = unknown> extends Emittery<SocketEvents<User>> 
     data: unknown,
     serializedFrame = serializeFrame({ type: 'event', event, data })
   ): number {
+    if (this.#exceedsOutboundPayload(serializedFrame)) return 0
     let delivered = 0
 
     for (const socket of this.#sockets.values()) {
-      if (this.#sendSerializedEventFrame(socket.raw.connection, serializedFrame)) {
+      if (this.#sendSerializedFrame(socket.raw.connection, serializedFrame)) {
         delivered += 1
       }
     }

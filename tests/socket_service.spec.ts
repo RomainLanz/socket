@@ -3485,50 +3485,292 @@ test.group('socket service', () => {
     }
   }).timeout(10_000)
 
-  test('closes a socket instead of sending an oversized acknowledgement', async ({ assert }) => {
+  test('answers an oversized acknowledgement with an error ack', async ({ assert }) => {
     class ChatChannel extends BaseChannel {
       static pattern = 'chat/:roomId'
 
       @onMessage('reply')
-      reply() {
-        return { content: 'x'.repeat(1024) }
+      reply(_socket: unknown, size: number) {
+        return { content: 'x'.repeat(size) }
       }
     }
 
     const httpServer = createServer()
     const socket = new SocketService()
     const router = new ChannelRouter()
+    const logger = makeLogger()
     router.register(ChatChannel as any)
-    await socket.boot(httpServer, { websocket: { maxOutboundPayload: 256 } }, router, makeLogger())
-    const port = await listen(httpServer)
-    const client = await connectClient(port)
+    await socket.boot(httpServer, { websocket: { maxOutboundPayload: 256 } }, router, logger)
+    const client = await connectClient(await listen(httpServer))
 
     try {
-      assert.equal(
-        (await sendAndWaitForAck(client, { type: 'subscribe', channel: 'chat/general' })).ok,
-        true
-      )
-      const close = waitForClose(client)
+      await sendAndWaitForAck(client, { type: 'subscribe', channel: 'chat/general' })
+      const oversized = await sendAndWaitForAck(client, {
+        type: 'message',
+        channel: 'chat/general',
+        event: 'reply',
+        data: 1024,
+      })
+      const small = await sendAndWaitForAck(client, {
+        type: 'message',
+        channel: 'chat/general',
+        event: 'reply',
+        data: 8,
+      })
 
+      assert.deepInclude(oversized, { type: 'ack', ok: false, error: 'Response too big' })
+      assert.isTrue(small.ok)
+      assert.equal(client.readyState, WebSocket.OPEN)
+      assert.lengthOf(logger.warnings, 1)
+      assert.match(String(logger.warnings[0][0]), /maxOutboundPayload/)
+
+      // A long request id makes even the error ack too big to send.
+      const closed = waitForClose(client)
       client.send(
         JSON.stringify({
-          id: 'oversized-ack',
+          id: 'i'.repeat(220),
           type: 'message',
           channel: 'chat/general',
           event: 'reply',
+          data: 1024,
         })
       )
-
-      const closed = await close
-      assert.equal(closed.code, 1009)
-      assert.equal(closed.reason, 'Socket outbound message too big')
+      assert.deepEqual(await closed, { code: 1009, reason: 'Socket outbound message too big' })
     } finally {
       client.close()
       await socket.close()
       await closeHttpServer(httpServer)
     }
-  }).timeout(10_000)
+  })
 
+  test('rolls back a subscription whose acknowledgement is too big', async ({ assert }) => {
+    const hooks: string[] = []
+
+    class RoomChannel extends BaseChannel {
+      static pattern = 'presence/:roomId'
+      static options = { presence: true }
+
+      getPresenceInfo(socket: { id: string }) {
+        return { id: socket.id, data: { bio: 'x'.repeat(600) } }
+      }
+
+      async onJoin() {
+        hooks.push('join')
+      }
+
+      async onMemberJoin() {
+        hooks.push('memberJoin')
+      }
+
+      async onMemberLeave() {
+        hooks.push('memberLeave')
+      }
+
+      async onLeave() {
+        hooks.push('leave')
+      }
+    }
+
+    const httpServer = createServer()
+    const socket = new SocketService()
+    const router = new ChannelRouter()
+    const presence = new PresenceManager()
+    const events: unknown[] = []
+    router.register(RoomChannel as any)
+    socket.setPresenceManager(presence)
+    await socket.boot(httpServer, { websocket: { maxOutboundPayload: 256 } }, router, makeLogger())
+    const client = await connectClient(await listen(httpServer))
+    client.on('message', (raw) => {
+      const frame = JSON.parse(raw.toString())
+      if (frame.type === 'event' && frame.event === 'ping') events.push(frame)
+    })
+
+    try {
+      const ack = await sendAndWaitForAck(client, { type: 'subscribe', channel: 'presence/a' })
+      socket.to('presence/a').emit('ping', null)
+      await sleep(50)
+
+      assert.deepInclude(ack, { type: 'ack', ok: false, error: 'Response too big' })
+      assert.deepEqual(hooks, ['memberJoin', 'join', 'memberLeave', 'leave'])
+      assert.equal(socket.health().channels, 0)
+      assert.equal(await presence.count('presence/a'), 0)
+      assert.deepEqual(events, [])
+      assert.equal(client.readyState, WebSocket.OPEN)
+    } finally {
+      client.close()
+      await socket.close()
+      await closeHttpServer(httpServer)
+    }
+  })
+
+  test('acknowledges a too big subscription once its leave hooks finish', async ({ assert }) => {
+    const leaveStarted = Promise.withResolvers<void>()
+    const releaseLeave = Promise.withResolvers<void>()
+    const events: string[] = []
+
+    class RoomChannel extends BaseChannel {
+      static pattern = 'presence/:roomId'
+      static options = { presence: true }
+
+      getPresenceInfo(socket: { id: string }) {
+        return { id: socket.id, data: { bio: 'x'.repeat(600) } }
+      }
+
+      async onLeave() {
+        leaveStarted.resolve()
+        await releaseLeave.promise
+        events.push('leave:done')
+      }
+    }
+
+    const httpServer = createServer()
+    const socket = new SocketService()
+    const router = new ChannelRouter()
+    const presence = new PresenceManager()
+    router.register(RoomChannel as any)
+    socket.setPresenceManager(presence)
+    await socket.boot(httpServer, { websocket: { maxOutboundPayload: 256 } }, router, makeLogger())
+    const client = await connectClient(await listen(httpServer))
+
+    try {
+      const ack = sendAndWaitForAck(client, { type: 'subscribe', channel: 'presence/a' }).then(
+        (frame) => {
+          events.push('ack')
+          return frame
+        }
+      )
+      await leaveStarted.promise
+      // The subscription is already rolled back while its onLeave runs.
+      assert.equal(socket.health().channels, 0)
+      assert.equal(await presence.count('presence/a'), 0)
+      await sleep(20)
+      assert.deepEqual(events, [])
+
+      releaseLeave.resolve()
+      assert.deepInclude(await ack, { type: 'ack', ok: false, error: 'Response too big' })
+      assert.deepEqual(events, ['leave:done', 'ack'])
+    } finally {
+      releaseLeave.resolve()
+      client.close()
+      await socket.close()
+      await closeHttpServer(httpServer)
+    }
+  })
+
+  test('runs a rolled-back subscription leave before the resubscribe joins ({kind})')
+    .with([{ kind: 'presence' as const }, { kind: 'channel' as const }])
+    .run(async ({ assert }, { kind }) => {
+      const leaveStarted = Promise.withResolvers<void>()
+      const releaseLeave = Promise.withResolvers<void>()
+      const events: string[] = []
+      const joinedSockets = new Set<string>()
+      let joins = 0
+      // Only the first subscribe answers with an acknowledgement too big to send.
+      const payload = () => ({ bio: joins === 0 ? 'x'.repeat(600) : 'small' })
+
+      class RoomChannel extends BaseChannel {
+        static pattern = 'room/:roomId'
+        static options = { presence: kind === 'presence' }
+        static middlewares = [
+          async (ctx: { setPresenceData(data: unknown): void }, next: () => Promise<void>) => {
+            if (kind === 'channel') ctx.setPresenceData(payload())
+            await next()
+          },
+        ]
+
+        getPresenceInfo(socket: { id: string }) {
+          return { id: socket.id, data: payload() }
+        }
+
+        async onJoin(socket: { id: string }) {
+          joins++
+          events.push('join')
+          joinedSockets.add(socket.id)
+        }
+
+        async onLeave(socket: { id: string }) {
+          events.push('leave:start')
+          if (events.filter((event) => event === 'leave:start').length === 1) {
+            leaveStarted.resolve()
+            await releaseLeave.promise
+          }
+          joinedSockets.delete(socket.id)
+          events.push('leave:done')
+        }
+      }
+
+      const httpServer = createServer()
+      const socket = new SocketService()
+      const router = new ChannelRouter()
+      router.register(RoomChannel as any)
+      socket.setPresenceManager(new PresenceManager())
+      await socket.boot(
+        httpServer,
+        { websocket: { maxOutboundPayload: 256 } },
+        router,
+        makeLogger()
+      )
+      const client = await connectClient(await listen(httpServer))
+
+      try {
+        const rejected = sendAndWaitForAck(client, { type: 'subscribe', channel: 'room/a' })
+        await leaveStarted.promise
+        const resubscribed = sendAndWaitForAck(client, { type: 'subscribe', channel: 'room/a' })
+        await sleep(20)
+        releaseLeave.resolve()
+
+        assert.deepInclude(await rejected, { ok: false, error: 'Response too big' })
+        assert.isTrue((await resubscribed).ok)
+        assert.deepEqual(events, ['join', 'leave:start', 'leave:done', 'join'])
+        assert.equal(joinedSockets.size, 1)
+        assert.equal(socket.health().channels, 1)
+      } finally {
+        releaseLeave.resolve()
+        client.close()
+        await socket.close()
+        await closeHttpServer(httpServer)
+      }
+    })
+
+  test('drops an oversized broadcast without closing its recipients', async ({ assert }) => {
+    class ChatChannel extends BaseChannel {
+      static pattern = 'chat/:roomId'
+    }
+
+    const httpServer = createServer()
+    const socket = new SocketService()
+    const router = new ChannelRouter()
+    const logger = makeLogger()
+    router.register(ChatChannel as any)
+    await socket.boot(httpServer, { websocket: { maxOutboundPayload: 256 } }, router, logger)
+    const port = await listen(httpServer)
+    const first = await connectClient(port)
+    const second = await connectClient(port)
+    const received: unknown[] = []
+    listenForEvents(first, 'notice', received)
+    listenForEvents(second, 'notice', received)
+
+    try {
+      await sendAndWaitForAck(first, { type: 'subscribe', channel: 'chat/general' })
+      await sendAndWaitForAck(second, { type: 'subscribe', channel: 'chat/general' })
+
+      socket.to('chat/general').emit('notice', { body: 'x'.repeat(1024) })
+      socket.broadcast('notice', { body: 'x'.repeat(1024) })
+      socket.to('chat/general').emit('notice', { body: 'small' })
+      await waitFor(() => received.length === 2)
+      await sleep(20)
+
+      assert.deepEqual(received, [{ body: 'small' }, { body: 'small' }])
+      assert.equal(first.readyState, WebSocket.OPEN)
+      assert.equal(second.readyState, WebSocket.OPEN)
+      assert.lengthOf(logger.warnings, 2)
+    } finally {
+      first.close()
+      second.close()
+      await socket.close()
+      await closeHttpServer(httpServer)
+    }
+  })
   test('does not publish a broadcast before validating its WebSocket frame', async ({ assert }) => {
     const driver = memory()()
     const publish = driver.publish.bind(driver)
