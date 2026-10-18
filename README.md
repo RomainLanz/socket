@@ -724,10 +724,12 @@ fake.assertCount(0)
 Without a transport, subscriptions, broadcasts, and presence stay inside one application instance.
 Configure an `@boringnode/bus` transport when multiple instances must exchange events.
 
-Install the dependency required by your transport. For Redis:
+Your config imports the transport from `@boringnode/bus`, so install it next to the dependency
+required by your transport, at the version this package uses. Package managers that do not hoist
+dependencies, such as pnpm, cannot resolve it otherwise. For Redis:
 
 ```sh
-yarn add ioredis
+yarn add @boringnode/bus@^0.10.0 ioredis
 ```
 
 ```ts
