@@ -27,6 +27,17 @@ export type FrameworkChannel<Registry, Pattern extends string> = FrameworkChanne
 >
 
 export type FrameworkChannelPattern<Registry> = ChannelPattern<Registry>
+/** Patterns of channels declared without parameters. */
+export type FrameworkStaticChannelPattern<Registry> = {
+  [Pattern in ChannelPattern<Registry>]: ChannelParameters<Registry, Pattern> extends undefined
+    ? Pattern
+    : never
+}[ChannelPattern<Registry>]
+/** Patterns of channels declared with parameters. */
+export type FrameworkParameterizedChannelPattern<Registry> = Exclude<
+  ChannelPattern<Registry>,
+  FrameworkStaticChannelPattern<Registry>
+>
 export type FrameworkChannelCallArgs<Registry> = ChannelCallArgs<Registry>
 export type FrameworkChannelParameters<
   Registry,

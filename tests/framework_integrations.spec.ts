@@ -11,7 +11,10 @@ import type { ConnectionState, EventHandler, SocketClientTransport } from '../sr
 import { createSocketComposables } from '../src/client/vue.js'
 import { onMessage } from '../src/decorators.js'
 
-class ChatChannel extends BaseChannel<unknown, { message: { id: string; body: string } }> {
+class ChatChannel extends BaseChannel<
+  unknown,
+  { message: { id: string; body: string }; typing: { user: string } }
+> {
   @onMessage('send')
   send(_socket: unknown, _payload: { body: string }): { accepted: true } {
     return { accepted: true }
@@ -25,8 +28,18 @@ class PersonPresenceChannel extends BaseChannel<unknown, { presence: { online: b
   }
 }
 
+class LobbyChannel extends BaseChannel<
+  unknown,
+  { joined: { user: string }; left: { reason: string } }
+> {}
+
 interface AppSocket {
   readonly channels: {
+    readonly 'lobby': {
+      readonly params: undefined
+      readonly channel: typeof LobbyChannel
+      readonly handlers: {}
+    }
     readonly 'chat/:room': {
       readonly params: { readonly room: string | number }
       readonly channel: typeof ChatChannel
@@ -97,6 +110,20 @@ function assertFrameworkTypes() {
   vue.useChannel('admin/people/:personType/:personId', { personType: 'official' })
   // @ts-expect-error all required parameters must be provided
   react.useChannel('admin/people/:personType/:personId', { personType: 'official' })
+
+  // Each handler receives the payload of its own event, not the union of the channel events
+  react.useChannelEvent('chat/:room', { room: 'general' }, 'typing', (typing) => typing.user)
+  vue.useChannelEvent('chat/:room', { room: 'general' }, 'typing', (typing) => typing.user)
+  react.useChannelEvent('lobby', 'joined', (joined) => joined.user)
+  vue.useChannelEvent('lobby', 'left', (left) => left.reason)
+  // @ts-expect-error the payload of 'message' has no user
+  react.useChannelEvent('chat/:room', { room: 'general' }, 'message', (message) => message.user)
+  // @ts-expect-error the payload of 'message' has no user
+  vue.useChannelEvent('chat/:room', { room: 'general' }, 'message', (message) => message.user)
+  // @ts-expect-error the payload of 'joined' has no reason
+  react.useChannelEvent('lobby', 'joined', (joined) => joined.reason)
+  // @ts-expect-error the payload of 'left' has no user
+  vue.useChannelEvent('lobby', 'left', (left) => left.user)
 }
 
 function assertFrameworkPatternUnions(

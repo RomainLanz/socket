@@ -25,6 +25,8 @@ import {
   type FrameworkChannelEventPayload,
   type FrameworkChannelParameters,
   type FrameworkChannelPattern,
+  type FrameworkParameterizedChannelPattern,
+  type FrameworkStaticChannelPattern,
 } from './framework.js'
 
 interface VueSocketContext<Registry> {
@@ -45,19 +47,6 @@ type VueChannelCallArgs<Registry> = {
     ? [pattern: Pattern]
     : [pattern: Pattern, parameters: ChannelParameterInput<Registry, Pattern>]
 }[FrameworkChannelPattern<Registry>]
-
-type VueChannelEventArgs<
-  Registry,
-  Pattern extends FrameworkChannelPattern<Registry>,
-  Event extends FrameworkChannelEvent<Registry, Pattern>,
-> =
-  FrameworkChannelParameters<Registry, Pattern> extends undefined
-    ? [event: Event, handler: EventHandler<FrameworkChannelEventPayload<Registry, Pattern, Event>>]
-    : [
-        parameters: ChannelParameterInput<Registry, Pattern>,
-        event: Event,
-        handler: EventHandler<FrameworkChannelEventPayload<Registry, Pattern, Event>>,
-      ]
 
 export function createSocketComposables<Registry = never>() {
   const key = Symbol('socket') as InjectionKey<VueSocketContext<Registry>>
@@ -132,15 +121,33 @@ export function createSocketComposables<Registry = never>() {
     return channel
   }
 
+  // `event` is a direct parameter with a `const` type so its literal, and the payload, are inferred
   function useChannelEvent<
-    const Pattern extends FrameworkChannelPattern<Registry>,
-    Event extends FrameworkChannelEvent<Registry, Pattern>,
-  >(pattern: Pattern | null, ...args: VueChannelEventArgs<Registry, Pattern, Event>): void {
+    const Pattern extends FrameworkStaticChannelPattern<Registry>,
+    const Event extends FrameworkChannelEvent<Registry, Pattern>,
+  >(
+    pattern: Pattern | null,
+    event: Event,
+    handler: EventHandler<FrameworkChannelEventPayload<Registry, Pattern, Event>>
+  ): void
+  function useChannelEvent<
+    const Pattern extends FrameworkParameterizedChannelPattern<Registry>,
+    const Event extends FrameworkChannelEvent<Registry, Pattern>,
+  >(
+    pattern: Pattern | null,
+    parameters: ChannelParameterInput<Registry, Pattern>,
+    event: Event,
+    handler: EventHandler<FrameworkChannelEventPayload<Registry, Pattern, Event>>
+  ): void
+  function useChannelEvent(
+    pattern: FrameworkChannelPattern<Registry> | null,
+    ...args: unknown[]
+  ): void {
     const socket = useSocket()
     const { parameterInput, event, handler } = resolveChannelEventArgs<
-      ChannelParameterInput<Registry, Pattern>,
-      Event,
-      FrameworkChannelEventPayload<Registry, Pattern, Event>
+      MaybeRefOrGetter<object | undefined>,
+      string,
+      unknown
     >(args)
     watch(
       () => (pattern === null ? null : toValue(parameterInput)),
