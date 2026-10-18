@@ -113,12 +113,19 @@ void [new Socket(options), success, failure, contradictorySuccess, missingError]
     await mkdir(completeConsumer)
     await writeConsumer(
       completeConsumer,
-      publicExports
+      `${publicExports
         .map(
           (specifier) =>
             `type Export${publicExports.indexOf(specifier)} = typeof import('${specifier}')`
         )
-        .join('\n'),
+        .join('\n')}
+import type { AuthenticatedSocket } from '@rlanz/socket/types'
+// ws types ship with the package, so the connection is typed without installing @types/ws.
+export function readConnection(connection: AuthenticatedSocket['raw']['connection']) {
+  // @ts-expect-error not a WebSocket member
+  return connection.notAWebSocketMember
+}
+`,
       true
     )
     await install(completeConsumer, [
@@ -132,7 +139,6 @@ void [new Socket(options), success, failure, contradictorySuccess, missingError]
       'react@^19.0.0',
       '@types/react@^19.0.0',
       '@types/node@^24.0.0',
-      '@types/ws@^8.18.0',
       'vue@^3.3.0',
     ])
     await execFileAsync('npx', ['tsc', '--project', 'tsconfig.json'], { cwd: completeConsumer })
